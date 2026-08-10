@@ -31,3 +31,9 @@ The script requires Python 3.10 or newer. `uv` installs its Python dependencies
 automatically. It uses the Claude Code CLI in print mode, so `claude` must be
 installed and able to access a model through your subscription. If needed, Eko
 will prompt you to sign in.
+
+Run the tests with:
+
+```bash
+uv run --with prompt-toolkit --with rich test_eko.py
+```

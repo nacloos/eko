@@ -67,8 +67,8 @@ SYSTEM = """You are Eko, working in {folder}.
 
 Write a fenced ```python block to act. After your response ends, it runs in that
 folder and its output arrives in a later user message inside <python_result> tags.
-Never write or predict those tags yourself. When the prompt is fully resolved,
-reply with <done/> and no Python block.
+Never write or predict those tags yourself. If no action is needed, answer
+directly. When the prompt is fully resolved, end with <done/> and no Python block.
 """
 
 NUDGE = "Write a fenced ```python block, or <done/> if the prompt is resolved."
