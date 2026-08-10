@@ -3,7 +3,7 @@
 Eko is a coding agent with almost no harness: an LLM, Python, and a persistent
 folder.
 
-The whole agent is one loop:
+The whole agent is essentially:
 
 ```python
 while prompt := user():

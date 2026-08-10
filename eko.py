@@ -11,7 +11,7 @@
     uv run eko.py
     uv run eko.py --cwd ~/projects/my-project "Find and fix a bug"
 
-The whole agent is one loop:
+The whole agent is essentially:
 
     while prompt := user():
         message = prompt
