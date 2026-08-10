@@ -13,9 +13,14 @@
 
 The whole agent is essentially:
 
-    while prompt := user():
-        message = prompt
-        while not (response := llm(message)).is_done():
+    message = None
+    while True:
+        message = message or user()
+        if message is None:
+            break
+        if (response := llm(message)).is_done():
+            message = None
+        else:
             message = run(response.python(), cwd)
 
 Python is the model's only interface. Through it, the model can inspect the folder,
@@ -168,36 +173,54 @@ class AgentIO(Protocol):
     """The few operations the agent loop needs from its surrounding app."""
 
     interrupted: threading.Event
+    stopping: threading.Event
 
+    def next_prompt(self) -> str | None: ...
     def ask(self, message: str) -> str: ...
     def show_response(self, response: str, code: str | None) -> None: ...
     def execute(self, code: str) -> Result: ...
     def show_result(self, result: Result) -> None: ...
     def take_input(self) -> str: ...
+    def stopped(self, message: str) -> None: ...
 
 
-def agent(prompt: str, io: AgentIO) -> None:
-    """Run the complete model → Python → result loop for one user prompt."""
-    message = prompt
+def agent(io: AgentIO) -> None:
+    """Alternate between user prompts and model-directed Python in one loop."""
+    message = None
     while True:
-        response = io.ask(message)
-        code = extract_python(response)
-        io.show_response(response, code)
-
-        if code is None and "<done/>" in response:
-            return
-        if code is None:
-            message = NUDGE
-        else:
-            result = io.execute(code)
-            io.show_result(result)
-            if io.interrupted.is_set():
+        if message is None:
+            message = io.next_prompt()
+            if message is None:
                 return
-            output = clipped(result.output) or "(no output)"
-            message = f"<python_result>\n{output}\n</python_result>"
+        try:
+            response = io.ask(message)
+            code = extract_python(response)
+            io.show_response(response, code)
 
-        if user_input := io.take_input():
-            message += f"\n\n{user_input}"
+            if code is None and "<done/>" in response:
+                message = None
+                continue
+            if code is None:
+                message = NUDGE
+            else:
+                result = io.execute(code)
+                io.show_result(result)
+                if io.interrupted.is_set():
+                    message = None
+                    continue
+                output = clipped(result.output) or "(no output)"
+                message = f"<python_result>\n{output}\n</python_result>"
+
+            if user_input := io.take_input():
+                message += f"\n\n{user_input}"
+        except InterruptedError:
+            io.stopped("Interrupted")
+            message = None
+        except Exception as error:
+            if io.stopping.is_set():
+                return
+            io.stopped(str(error))
+            message = None
 
 
 # ── Terminal rendering ────────────────────────────────────────────────────────
@@ -894,7 +917,7 @@ class Session:
             return user_input
         return self.followups.get()
 
-    # AgentIO: adapt the core loop to the model connection and terminal UI.
+    # Adapt the core loop to the model connection and terminal UI.
     def ask(self, message: str) -> str:
         self.state = "thinking"
         with self.ui.streaming() as write:
@@ -911,21 +934,14 @@ class Session:
     def show_result(self, result: Result) -> None:
         self.ui.result(result)
 
+    def stopped(self, message: str) -> None:
+        self.ui.stopped(message)
+
 
 def run_session(session: Session) -> None:
-    """Feed queued prompts to the core agent from a background thread."""
-    message = session.next_prompt()
+    """Run the core agent and ensure its model process is cleaned up."""
     try:
-        while message is not None:
-            try:
-                agent(message, session)
-            except InterruptedError:
-                session.ui.stopped("Interrupted")
-            except Exception as error:
-                if session.stopping.is_set():
-                    break
-                session.ui.stopped(str(error))
-            message = session.next_prompt()
+        agent(session)
     finally:
         session.llm.close()
 

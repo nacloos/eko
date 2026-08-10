@@ -6,9 +6,14 @@ folder.
 The whole agent is essentially:
 
 ```python
-while prompt := user():
-    message = prompt
-    while not (response := llm(message)).is_done():
+message = None
+while True:
+    message = message or user()
+    if message is None:
+        break
+    if (response := llm(message)).is_done():
+        message = None
+    else:
         message = run(response.python(), cwd)
 ```
 

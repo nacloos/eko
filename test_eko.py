@@ -75,14 +75,18 @@ class FakeModel:
 
 
 class CoreAgentTests(unittest.TestCase):
-    def test_agent_loop_only_needs_model_python_and_events(self):
+    def test_single_loop_only_needs_model_python_and_events(self):
         class IO:
             def __init__(self):
                 self.interrupted = threading.Event()
+                self.stopping = threading.Event()
+                self.prompts = iter(["start", None])
                 self.messages = []
-                self.responses = []
                 self.results = []
                 self.input = "while you work"
+
+            def next_prompt(self):
+                return next(self.prompts)
 
             def ask(self, message):
                 self.messages.append(message)
@@ -91,7 +95,7 @@ class CoreAgentTests(unittest.TestCase):
                 return "finished<done/>"
 
             def show_response(self, response, code):
-                self.responses.append((response, code))
+                pass
 
             def execute(self, code):
                 self.asserted_code = code
@@ -104,14 +108,16 @@ class CoreAgentTests(unittest.TestCase):
                 message, self.input = self.input, ""
                 return message
 
+            def stopped(self, message):
+                raise AssertionError(message)
+
         io = IO()
-        eko.agent("start", io)
+        eko.agent(io)
         self.assertEqual(io.asserted_code, "print('hello')\n")
-        self.assertEqual(io.messages[0], "start")
-        self.assertEqual(
-            io.messages[1],
-            "<python_result>\nhello\n\n</python_result>\n\nwhile you work")
-        self.assertEqual(len(io.responses), 2)
+        self.assertEqual(io.messages, [
+            "start",
+            "<python_result>\nhello\n\n</python_result>\n\nwhile you work",
+        ])
         self.assertEqual(len(io.results), 1)
 
 
