@@ -23,8 +23,8 @@ The whole agent is essentially:
         else:
             message = run(response.python(), cwd)
 
-Python is the model's only interface. Through it, the model can inspect the folder,
-use the shell, and write its own tools. Everything it writes there persists.
+Python is the only tool built into the harness. Through it, the model can inspect
+the folder, use the shell, and write its own tools.
 
 The loop only needs access to an LLM. That could come from an API; this version uses
 the Claude Code CLI in print mode, which can access the model through a subscription,

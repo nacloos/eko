@@ -17,8 +17,8 @@ while True:
         message = run(response.python(), cwd)
 ```
 
-Python is the "tool" backed in the harness. Through it, the model can inspect the
-folder, use the shell, and write its own tools.
+Python is the only tool built into the harness. Through it, the model can inspect
+the folder, use the shell, and write its own tools.
 
 Run it interactively:
 
