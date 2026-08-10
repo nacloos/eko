@@ -12,7 +12,7 @@ while prompt := user():
         message = run(response.python(), cwd)
 ```
 
-Python is the model's only interface. Through it, the model can inspect the
+Python is the model's only tool. Through it, the model can inspect the
 folder, use the shell, and write its own tools.
 
 Run it interactively:
