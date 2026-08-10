@@ -13,8 +13,7 @@ while prompt := user():
 ```
 
 Python is the model's only interface. Through it, the model can inspect the
-folder, use the shell, and write its own tools. Everything it writes there
-persists.
+folder, use the shell, and write its own tools.
 
 Run it interactively:
 
