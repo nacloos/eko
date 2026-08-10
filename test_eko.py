@@ -330,6 +330,24 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_close_tolerates_concurrent_interrupt_clearing_process(self):
+        model = eko.ClaudeModel(Path.cwd(), "fake", "low")
+        stdout = io.BytesIO()
+
+        class Process:
+            def __init__(self):
+                self.stdin = None
+                self.stdout = stdout
+
+            def poll(self):
+                model.proc = None
+                return 0
+
+        model.proc = Process()
+        model.close()
+        self.assertTrue(stdout.closed)
+        self.assertIsNone(model.proc)
+
     def test_failed_resume_can_recover_same_session(self):
         model = eko.ClaudeModel(Path.cwd(), "fake", "low")
         model.started = True

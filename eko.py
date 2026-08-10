@@ -773,20 +773,22 @@ class ClaudeModel:
 
     def close(self) -> None:
         """Give the CLI a brief chance to flush its session, then stop it."""
-        if self.proc is None:
+        proc = self.proc
+        if proc is None:
             return
-        if self.proc.poll() is None:
+        if proc.poll() is None:
             try:
-                assert self.proc.stdin
-                self.proc.stdin.close()
-                self.proc.stdin = None
-                self.proc.wait(timeout=3)
+                assert proc.stdin
+                proc.stdin.close()
+                proc.stdin = None
+                proc.wait(timeout=3)
             except (BrokenPipeError, subprocess.TimeoutExpired):
                 self._terminate(signal.SIGTERM)
                 return
-        if self.proc.stdout:
-            self.proc.stdout.close()
-        self.proc = None
+        if proc.stdout:
+            proc.stdout.close()
+        if self.proc is proc:
+            self.proc = None
 
     def interrupt(self) -> None:
         self.interrupted.set()
