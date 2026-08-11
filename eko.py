@@ -194,6 +194,8 @@ def agent(io: AgentIO) -> None:
                 return
         try:
             response = io.ask(message)
+            warn = any(kind == "prose" and "<python_result>" in text
+                       for kind, text, _ in response_segments(response))
             code = extract_python(response)
             io.show_response(response, code)
 
@@ -210,6 +212,10 @@ def agent(io: AgentIO) -> None:
                     continue
                 output = clipped(result.output) or "(no output)"
                 message = f"<python_result>\n{output}\n</python_result>"
+
+            if warn:
+                message += ("\n\nWarning: unless intentional, do not generate the "
+                            "Python result tag; wait for the actual result.")
 
             if user_input := io.take_input():
                 message += f"\n\n{user_input}"

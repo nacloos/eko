@@ -120,6 +120,36 @@ class CoreAgentTests(unittest.TestCase):
         ])
         self.assertEqual(len(io.results), 1)
 
+    def test_model_predicted_result_gets_warning(self):
+        class IO:
+            interrupted = threading.Event()
+            stopping = threading.Event()
+
+            def __init__(self):
+                self.messages = []
+
+            def next_prompt(self):
+                return "start" if not self.messages else None
+
+            def ask(self, message):
+                self.messages.append(message)
+                if len(self.messages) == 1:
+                    return "```python\nprint('ok')\n```\n<python_result>fake</python_result>"
+                return "<done/>"
+
+            def show_response(self, response, code): pass
+            def execute(self, code): return eko.Result("ok\n", 0, .1)
+            def show_result(self, result): pass
+            def take_input(self): return ""
+            def stopped(self, message): raise AssertionError(message)
+
+        io = IO()
+        eko.agent(io)
+        self.assertEqual(io.messages[1],
+                         "<python_result>\nok\n\n</python_result>\n\n"
+                         "Warning: unless intentional, do not generate the Python "
+                         "result tag; wait for the actual result.")
+
 
 class SessionTests(unittest.TestCase):
     def session(self, replies):
