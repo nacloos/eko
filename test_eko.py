@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -449,6 +450,49 @@ class ModelTests(unittest.TestCase):
         model.close()
         self.assertTrue(stdout.closed)
         self.assertIsNone(model.proc)
+
+    def test_exact_empty_text_resume_error_repairs_only_its_assistant_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "projects" / "project"
+            project.mkdir(parents=True)
+            model = eko.ClaudeModel(Path.cwd(), "fake", "low")
+            model.started = True
+            session = project / f"{model.session_id}.jsonl"
+            unchanged = '{"type":"user","message":{"content":[{"type":"text","text":""}]}}\n'
+            broken = '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""},{"type":"text","text":""}]}}\n'
+            session.write_text(unchanged + broken)
+            failed = json.dumps({
+                "type": "result", "is_error": True,
+                "result": "API Error: 400 messages: text content blocks must be non-empty",
+            }) + "\n"
+            recovered = "".join(json.dumps(event) + "\n" for event in [
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "recovered"}]}},
+                {"type": "result", "is_error": False},
+            ])
+            starts = []
+
+            def start():
+                payload = failed if not starts else recovered
+                starts.append(True)
+                script = ("import sys; sys.stdin.buffer.readline(); "
+                          f"sys.stdout.buffer.write({payload.encode()!r}); "
+                          "sys.stdout.buffer.flush()")
+                model.proc = subprocess.Popen(
+                    [sys.executable, "-c", script], stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+
+            model._start = start
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": directory}):
+                self.assertEqual(model.ask("continue", lambda _: None), "recovered")
+                model.close()
+
+            lines = session.read_text().splitlines(keepends=True)
+            self.assertEqual(lines[0], unchanged)
+            content = json.loads(lines[1])["message"]["content"]
+            self.assertEqual(content[0]["thinking"], "")
+            self.assertEqual(content[1]["text"], " ")
+            self.assertEqual(len(starts), 2)
 
     def test_failed_resume_can_recover_same_session(self):
         model = eko.ClaudeModel(Path.cwd(), "fake", "low")

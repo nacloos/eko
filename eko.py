@@ -713,6 +713,38 @@ class ClaudeModel:
         self.started = False
         self.interrupted = threading.Event()
 
+    def _repair_session(self) -> bool:
+        """Repair this session's empty assistant text blocks."""
+        config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+        projects = config / "projects"
+        if not projects.is_dir():
+            return False
+        for path in projects.glob(f"*/{self.session_id}.jsonl"):
+            lines = path.read_text().splitlines(keepends=True)
+            changed = False
+            for index, line in enumerate(lines):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "assistant":
+                    continue
+                content = record.get("message", {}).get("content", [])
+                repaired = False
+                for block in content:
+                    if block.get("type") == "text" and block.get("text") == "":
+                        block["text"] = " "
+                        repaired = changed = True
+                if repaired:
+                    ending = "\n" if line.endswith("\n") else ""
+                    lines[index] = json.dumps(record, separators=(",", ":")) + ending
+            if changed:
+                temporary = path.with_suffix(".jsonl.tmp")
+                temporary.write_text("".join(lines))
+                os.replace(temporary, path)
+                return True
+        return False
+
     def _start(self) -> None:
         session = (["--resume", self.session_id] if self.started else
                    ["--session-id", self.session_id])
@@ -799,6 +831,9 @@ class ClaudeModel:
                         self._terminate(signal.SIGTERM)
                         proc.stdin.close()
                         proc.stdout.close()
+                        if ("text content blocks must be non-empty" in str(detail)
+                                and self._repair_session()):
+                            return self.ask(message, on_text, deadline, retry_delay)
                         remaining = deadline - time.monotonic()
                         if remaining > 0 and not parts and not complete:
                             delay = min(retry_delay, remaining)
