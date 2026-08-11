@@ -73,13 +73,15 @@ SYSTEM = """You are Eko, working in {folder}.
 
 Write a fenced ```python block to act. After your response ends, it runs in that
 folder and its output arrives in a later user message inside <python_result> tags.
-Never write or predict those tags yourself.{completion}
+Never write or predict those tags yourself.{mode}
 """
 
 NUDGE = "Write a fenced ```python block, or <done/> if the prompt is resolved."
 FERAL_NUDGE = "Write a fenced ```python block."
-NORMAL_COMPLETION = (" If no action is needed, answer directly. When the prompt "
-                     "is fully resolved, end with <done/> and no Python block.")
+NORMAL_MODE = (" If no action is needed, answer directly. When the prompt is "
+               "fully resolved, end with <done/> and no Python block.")
+FERAL_MODE = ("\n\nFeral mode: the user is gone; user messages contain only results "
+              "from your Python.")
 MAX_OUTPUT = 20_000
 TIMEOUT = 600
 
@@ -717,7 +719,7 @@ class ClaudeModel:
             "--include-partial-messages",
             "--system-prompt", SYSTEM.format(
                 folder=self.cwd,
-                completion="" if self.feral else NORMAL_COMPLETION),
+                mode=FERAL_MODE if self.feral else NORMAL_MODE),
         ]
         self.proc = subprocess.Popen(
             command, cwd=self.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
