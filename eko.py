@@ -574,8 +574,8 @@ class UI:
             done.wait(2)
         return 0
 
-    def header(self, cwd: Path, model: str) -> None:
-        header = Group(Text("eko", style=f"bold {GOLD}"), Text.assemble(
+    def header(self, cwd: Path, model: str, name: str = NAME) -> None:
+        header = Group(Text(name, style=f"bold {GOLD}"), Text.assemble(
             (str(cwd), "dim"), ("  ·  ", "dim"), (model, "dim"),
             ("  ·  signed in", "dim")), Text(""))
         # Place the initial composer near the bottom. These are real terminal
@@ -984,7 +984,7 @@ def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
         raise ValueError(f"not a directory: {cwd}")
     ensure_auth()
     ui = UI()
-    ui.header(cwd, model)
+    ui.header(cwd, model, name)
     if prompt:
         ui.user(prompt)
     session = Session(cwd, model, effort, ui, feral, executor=executor, name=name,

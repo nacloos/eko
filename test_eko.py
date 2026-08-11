@@ -592,7 +592,7 @@ class TerminalTests(unittest.TestCase):
             time.sleep(.8)
             initial = tmux(
                 "capture-pane", "-p", "-t", "eko", capture=True).stdout
-            self.assertIn("eko\n", initial)
+            self.assertIn("Eko\n", initial)
             self.assertIn(f"{Path(__file__).parent}  ·  fake  ·  signed in", initial)
             initial_lines = initial.splitlines()
             divider = initial_lines.index("─" * 100)
