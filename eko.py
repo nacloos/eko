@@ -10,6 +10,7 @@
 
     uv run eko.py
     uv run eko.py --cwd ~/projects/my-project "Find and fix a bug"
+    uv run eko.py --feral "Keep improving this project"
 
 The whole agent is essentially:
 
@@ -72,11 +73,13 @@ SYSTEM = """You are Eko, working in {folder}.
 
 Write a fenced ```python block to act. After your response ends, it runs in that
 folder and its output arrives in a later user message inside <python_result> tags.
-Never write or predict those tags yourself. If no action is needed, answer
-directly. When the prompt is fully resolved, end with <done/> and no Python block.
+Never write or predict those tags yourself.{completion}
 """
 
 NUDGE = "Write a fenced ```python block, or <done/> if the prompt is resolved."
+FERAL_NUDGE = "Write a fenced ```python block."
+NORMAL_COMPLETION = (" If no action is needed, answer directly. When the prompt "
+                     "is fully resolved, end with <done/> and no Python block.")
 MAX_OUTPUT = 20_000
 TIMEOUT = 600
 
@@ -174,6 +177,7 @@ class AgentIO(Protocol):
 
     interrupted: threading.Event
     stopping: threading.Event
+    feral: bool
 
     def next_prompt(self) -> str | None: ...
     def ask(self, message: str) -> str: ...
@@ -199,11 +203,11 @@ def agent(io: AgentIO) -> None:
             code = extract_python(response)
             io.show_response(response, code)
 
-            if code is None and "<done/>" in response:
+            if code is None and "<done/>" in response and not io.feral:
                 message = None
                 continue
             if code is None:
-                message = NUDGE
+                message = FERAL_NUDGE if io.feral else NUDGE
             else:
                 result = io.execute(code)
                 io.show_result(result)
@@ -691,10 +695,12 @@ class ClaudeModel:
     the model's context, while ``--tools ''`` leaves generated Python as its only action.
     """
 
-    def __init__(self, cwd: Path, model: str, effort: str) -> None:
+    def __init__(self, cwd: Path, model: str, effort: str,
+                 feral: bool = False) -> None:
         self.cwd = cwd
         self.model = model
         self.effort = effort
+        self.feral = feral
         self.session_id = str(uuid.uuid4())
         self.proc: subprocess.Popen[bytes] | None = None
         self.started = False
@@ -709,7 +715,9 @@ class ClaudeModel:
             *session,
             "--input-format", "stream-json", "--output-format", "stream-json",
             "--include-partial-messages",
-            "--system-prompt", SYSTEM.format(folder=self.cwd),
+            "--system-prompt", SYSTEM.format(
+                folder=self.cwd,
+                completion="" if self.feral else NORMAL_COMPLETION),
         ]
         self.proc = subprocess.Popen(
             command, cwd=self.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -858,10 +866,12 @@ def ensure_auth() -> None:
 class Session:
     """Run the model loop while keeping the composer available for new input."""
 
-    def __init__(self, cwd: Path, model: str, effort: str, ui: UI) -> None:
+    def __init__(self, cwd: Path, model: str, effort: str, ui: UI,
+                 feral: bool = False) -> None:
         self.cwd = cwd
         self.ui = ui
-        self.llm = ClaudeModel(cwd, model, effort)
+        self.feral = feral
+        self.llm = ClaudeModel(cwd, model, effort, feral)
         self.followups: queue.Queue[str | None] = queue.Queue()
         self.inputs: queue.Queue[str] = queue.Queue()
         self.stopping = threading.Event()
@@ -958,6 +968,9 @@ def main() -> None:
     parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="working directory")
     parser.add_argument("--model", default="claude-opus-5")
     parser.add_argument("--effort", default="high")
+    parser.add_argument(
+        "--feral", action="store_true",
+        help="keep acting without a completion state until interrupted")
     args = parser.parse_args()
 
     cwd = args.cwd.expanduser().resolve()
@@ -968,7 +981,7 @@ def main() -> None:
     ui.header(cwd, args.model)
     if args.prompt:
         ui.user(args.prompt)
-    session = Session(cwd, args.model, args.effort, ui)
+    session = Session(cwd, args.model, args.effort, ui, args.feral)
     ui.status = session.status
     ui.pending = session.pending
     ui.on_submit = session.submit

@@ -80,6 +80,7 @@ class CoreAgentTests(unittest.TestCase):
             def __init__(self):
                 self.interrupted = threading.Event()
                 self.stopping = threading.Event()
+                self.feral = False
                 self.prompts = iter(["start", None])
                 self.messages = []
                 self.results = []
@@ -120,10 +121,51 @@ class CoreAgentTests(unittest.TestCase):
         ])
         self.assertEqual(len(io.results), 1)
 
+    def test_feral_mode_ignores_done_and_keeps_acting(self):
+        class IO:
+            def __init__(self):
+                self.interrupted = threading.Event()
+                self.stopping = threading.Event()
+                self.feral = True
+                self.prompts = iter(["start", None])
+                self.messages = []
+
+            def next_prompt(self):
+                return next(self.prompts)
+
+            def ask(self, message):
+                self.messages.append(message)
+                if len(self.messages) == 1:
+                    return "<done/>"
+                return "```python\nprint('still going')\n```"
+
+            def show_response(self, response, code):
+                pass
+
+            def execute(self, code):
+                self.code = code
+                self.interrupted.set()
+                return eko.Result("still going\n", 0, .1)
+
+            def show_result(self, result):
+                pass
+
+            def take_input(self):
+                return ""
+
+            def stopped(self, message):
+                raise AssertionError(message)
+
+        io = IO()
+        eko.agent(io)
+        self.assertEqual(io.messages, ["start", eko.FERAL_NUDGE])
+        self.assertEqual(io.code, "print('still going')\n")
+
     def test_model_predicted_result_gets_warning(self):
         class IO:
             interrupted = threading.Event()
             stopping = threading.Event()
+            feral = False
 
             def __init__(self):
                 self.messages = []

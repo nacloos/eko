@@ -32,6 +32,13 @@ Or give it a working folder and an initial prompt:
 uv run eko.py --cwd ~/projects/my-project "Find and fix a bug"
 ```
 
+Feral mode removes the completion state and keeps Eko acting until you interrupt
+it with Escape:
+
+```bash
+uv run eko.py --feral "Keep improving this project"
+```
+
 The script requires Python 3.10 or newer. `uv` installs its Python dependencies
 automatically. It uses the Claude Code CLI in print mode, so `claude` must be
 installed and able to access a model through your subscription. If needed, Eko
