@@ -205,6 +205,21 @@ class SessionTests(unittest.TestCase):
         session.thread.join(2)
         self.assertFalse(session.thread.is_alive())
 
+    def test_session_can_use_a_caller_provided_executor(self):
+        calls = []
+
+        def execute(code, interrupted):
+            calls.append((code, interrupted))
+            return eko.Result("custom\n", 0, .25)
+
+        ui = FakeUI()
+        session = eko.Session(Path.cwd(), "fake", "low", ui, executor=execute)
+        result = session.execute("print('custom')")
+
+        self.assertEqual(result, eko.Result("custom\n", 0, .25))
+        self.assertEqual(calls, [("print('custom')", session.interrupted)])
+        self.assertEqual(session.state, "running Python")
+
     def test_interrupt_continues_with_message_typed_while_busy(self):
         def replies(message, cancelled):
             if message == "slow":
@@ -408,6 +423,15 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_identity_is_configurable_and_location_is_neutral(self):
+        prompt = eko.SYSTEM.format(name="Moa", folder="/workspace", mode="")
+        self.assertTrue(prompt.startswith("You are Moa.\nYou are in /workspace.\n"))
+        self.assertEqual(eko.NAME, "Eko")
+        model = eko.ClaudeModel(
+            Path("/host/private"), "fake", "low", name="Moa", folder="/workspace")
+        self.assertEqual(model.cwd, Path("/host/private"))
+        self.assertEqual(model.folder, "/workspace")
+
     def test_close_tolerates_concurrent_interrupt_clearing_process(self):
         model = eko.ClaudeModel(Path.cwd(), "fake", "low")
         stdout = io.BytesIO()

@@ -69,7 +69,9 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 
-SYSTEM = """You are Eko, working in {folder}.
+NAME = "Eko"
+SYSTEM = """You are {name}.
+You are in {folder}.
 
 Write a fenced ```python block to act. After your response ends, it runs in that
 folder and its output arrives in a later user message inside <python_result> tags.
@@ -698,11 +700,14 @@ class ClaudeModel:
     """
 
     def __init__(self, cwd: Path, model: str, effort: str,
-                 feral: bool = False) -> None:
+                 feral: bool = False, name: str = NAME,
+                 folder: str | Path | None = None) -> None:
         self.cwd = cwd
+        self.folder = folder if folder is not None else cwd
         self.model = model
         self.effort = effort
         self.feral = feral
+        self.name = name
         self.session_id = str(uuid.uuid4())
         self.proc: subprocess.Popen[bytes] | None = None
         self.started = False
@@ -718,7 +723,7 @@ class ClaudeModel:
             "--input-format", "stream-json", "--output-format", "stream-json",
             "--include-partial-messages",
             "--system-prompt", SYSTEM.format(
-                folder=self.cwd,
+                name=self.name, folder=self.folder,
                 mode=FERAL_MODE if self.feral else NORMAL_MODE),
         ]
         self.proc = subprocess.Popen(
@@ -869,11 +874,14 @@ class Session:
     """Run the model loop while keeping the composer available for new input."""
 
     def __init__(self, cwd: Path, model: str, effort: str, ui: UI,
-                 feral: bool = False) -> None:
+                 feral: bool = False,
+                 executor: Callable[[str, threading.Event], Result] | None = None,
+                 name: str = NAME, folder: str | Path | None = None) -> None:
         self.cwd = cwd
         self.ui = ui
         self.feral = feral
-        self.llm = ClaudeModel(cwd, model, effort, feral)
+        self.executor = executor
+        self.llm = ClaudeModel(cwd, model, effort, feral, name, folder)
         self.followups: queue.Queue[str | None] = queue.Queue()
         self.inputs: queue.Queue[str] = queue.Queue()
         self.stopping = threading.Event()
@@ -947,6 +955,8 @@ class Session:
     def execute(self, code: str) -> Result:
         self.state = "running Python"
         with self.ui.activity("running"):
+            if self.executor is not None:
+                return self.executor(code, self.interrupted)
             return run_python(code, self.cwd, self.interrupted)
 
     def show_result(self, result: Result) -> None:
@@ -964,26 +974,21 @@ def run_session(session: Session) -> None:
         session.llm.close()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("prompt", nargs="?", help="prompt to run; opens an input if omitted")
-    parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="working directory")
-    parser.add_argument("--model", default="claude-opus-5")
-    parser.add_argument("--effort", default="high")
-    parser.add_argument(
-        "--feral", action="store_true",
-        help="keep acting without a completion state until interrupted")
-    args = parser.parse_args()
-
-    cwd = args.cwd.expanduser().resolve()
+def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
+        effort: str = "high", feral: bool = False,
+        executor: Callable[[str, threading.Event], Result] | None = None,
+        name: str = NAME, folder: str | Path | None = None) -> None:
+    """Run Eko interactively, optionally using a caller-provided Python executor."""
+    cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
-        parser.error(f"not a directory: {cwd}")
+        raise ValueError(f"not a directory: {cwd}")
     ensure_auth()
     ui = UI()
-    ui.header(cwd, args.model)
-    if args.prompt:
-        ui.user(args.prompt)
-    session = Session(cwd, args.model, args.effort, ui, args.feral)
+    ui.header(cwd, model)
+    if prompt:
+        ui.user(prompt)
+    session = Session(cwd, model, effort, ui, feral, executor=executor, name=name,
+                      folder=folder)
     ui.status = session.status
     ui.pending = session.pending
     ui.on_submit = session.submit
@@ -994,7 +999,7 @@ def main() -> None:
         ui.exit()
 
     ui.on_exit = exit_app
-    ui.on_start = lambda: session.start(args.prompt)
+    ui.on_start = lambda: session.start(prompt)
     try:
         ui.run()
     except KeyboardInterrupt:
@@ -1002,6 +1007,28 @@ def main() -> None:
     finally:
         session.stop()
     session.thread.join(timeout=5)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("prompt", nargs="?", help="prompt to run; opens an input if omitted")
+    parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="working directory")
+    parser.add_argument("--model", default="claude-opus-5")
+    parser.add_argument("--effort", default="high")
+    parser.add_argument("--name", default=NAME)
+    parser.add_argument(
+        "--feral", action="store_true",
+        help="keep acting without a completion state until interrupted")
+    args = parser.parse_args()
+
+    cwd = args.cwd.expanduser().resolve()
+    if not cwd.is_dir():
+        parser.error(f"not a directory: {cwd}")
+    try:
+        run(cwd, args.prompt, model=args.model, effort=args.effort, feral=args.feral,
+            name=args.name)
+    except ValueError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":
