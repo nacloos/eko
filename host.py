@@ -75,13 +75,15 @@ class Claude:
     """
 
     def __init__(self, cwd: Path, model: str = "claude-opus-5",
-                 effort: str = "high") -> None:
+                 effort: str = "high", session_id: str | None = None,
+                 resume: bool = False) -> None:
         self.cwd = cwd
         self.model = model
         self.effort = effort
-        self.session_id = str(uuid.uuid4())
+        self.session_id = session_id or str(uuid.uuid4())
+        uuid.UUID(self.session_id)
         self.proc: subprocess.Popen[bytes] | None = None
-        self.started = False
+        self.started = resume
         self.interrupted = threading.Event()
 
     def _repair_session(self) -> bool:
@@ -781,9 +783,10 @@ class AgentProcess:
 
 
 def _model_client(connection: socket.socket, cwd: Path,
-                  model: str, effort: str) -> None:
+                  model: str, effort: str, session_id: str | None = None,
+                  resume: bool = False) -> None:
     """Give one agent connection an independent Claude conversation."""
-    claude = Claude(cwd, model, effort)
+    claude = Claude(cwd, model, effort, session_id, resume)
     lock = threading.Lock()
     active: threading.Thread | None = None
 
@@ -831,8 +834,11 @@ def _model_client(connection: socket.socket, cwd: Path,
 
 
 class ModelServer:
-    def __init__(self, path: Path, cwd: Path, model: str, effort: str) -> None:
+    def __init__(self, path: Path, cwd: Path, model: str, effort: str,
+                 session_id: str | None = None, resume: bool = False) -> None:
         self.path, self.cwd, self.model, self.effort = path, cwd, model, effort
+        self.primary_session = (session_id, resume)
+        self.session_lock = threading.Lock()
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(path))
         self.listener.listen()
@@ -852,9 +858,13 @@ class ModelServer:
                 continue
             except OSError:
                 return
+            with self.session_lock:
+                session_id, resume = self.primary_session
+                self.primary_session = (None, False)
             thread = threading.Thread(
                 target=_model_client,
-                args=(connection, self.cwd, self.model, self.effort), daemon=True)
+                args=(connection, self.cwd, self.model, self.effort,
+                      session_id, resume), daemon=True)
             thread.start()
             self.clients.append(thread)
 
@@ -1018,7 +1028,8 @@ def print_event(event: core.Event) -> None:
 
 def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         feral: bool, name: str, headless: bool, sandbox: bool,
-        world_socket: Path | None = None) -> None:
+        world_socket: Path | None = None, session_id: str | None = None,
+        resume: bool = False) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -1026,7 +1037,9 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
     upstream_world = world_socket or os.environ.get("EKO_WORLD")
     with tempfile.TemporaryDirectory(prefix="eko-") as directory:
         runtime = Path(directory)
-        server = ModelServer(runtime / "model.sock", cwd, model, effort)
+        server = ModelServer(
+            runtime / "model.sock", cwd, model, effort, session_id, resume
+        )
         server.start()
         relay = (
             WorldRelay(runtime / "world.sock", Path(upstream_world))
@@ -1095,12 +1108,21 @@ def main() -> None:
         "--world-socket", type=Path,
         help="connect the agent to an external world socket",
     )
+    session = parser.add_mutually_exclusive_group()
+    session.add_argument(
+        "--session-id", help="UUID to use for a new primary conversation"
+    )
+    session.add_argument(
+        "--resume", metavar="UUID", help="resume the primary conversation UUID"
+    )
     args = parser.parse_args()
 
     def launch(cwd: Path) -> None:
         run(cwd, args.prompt, model=args.model, effort=args.effort,
             feral=args.feral, name=args.name, headless=args.headless,
-            sandbox=args.sandbox, world_socket=args.world_socket)
+            sandbox=args.sandbox, world_socket=args.world_socket,
+            session_id=args.session_id or args.resume,
+            resume=args.resume is not None)
 
     try:
         if args.feral and args.cwd is None:

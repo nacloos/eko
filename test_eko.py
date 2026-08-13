@@ -661,6 +661,44 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_host_accepts_new_and_resumed_primary_sessions(self):
+        session_id = "12345678-1234-5678-1234-567812345678"
+        for option, expected_resume in (
+            ("--session-id", False), ("--resume", True)
+        ):
+            with (
+                mock.patch.object(sys, "argv", ["eko", option, session_id]),
+                mock.patch.object(host, "run") as run,
+            ):
+                host.main()
+            self.assertEqual(run.call_args.kwargs["session_id"], session_id)
+            self.assertEqual(run.call_args.kwargs["resume"], expected_resume)
+
+    def test_model_server_assigns_persisted_session_only_to_primary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_id = "12345678-1234-5678-1234-567812345678"
+            server = host.ModelServer(
+                root / "model.sock", root, "fake", "low", session_id, True
+            )
+            observed = []
+
+            def model_client(connection, _cwd, _model, _effort,
+                             assigned=None, resume=False):
+                observed.append((assigned, resume))
+                connection.close()
+
+            with mock.patch.object(host, "_model_client", side_effect=model_client):
+                server.start()
+                for _ in range(2):
+                    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    client.connect(str(root / "model.sock"))
+                    client.close()
+                wait_until(lambda: len(observed) == 2)
+                server.close()
+
+        self.assertCountEqual(observed, [(session_id, True), (None, False)])
+
     def test_host_accepts_an_explicit_world_socket(self):
         with (
             mock.patch.object(
