@@ -597,6 +597,45 @@ def _reap_children() -> None:
         time.sleep(.2)
 
 
+def _shutdown_children(grace: float = 1) -> None:
+    """Terminate and reap every remaining child before namespace PID 1 exits."""
+    children = Path("/proc/1/task/1/children")
+
+    def pids() -> list[int]:
+        try:
+            return [int(pid) for pid in children.read_text().split()]
+        except OSError:
+            return []
+
+    def reap() -> None:
+        while True:
+            try:
+                if os.waitpid(-1, os.WNOHANG) == (0, 0):
+                    return
+            except ChildProcessError:
+                return
+
+    deadline = time.monotonic() + grace
+    while pids() and time.monotonic() < deadline:
+        for pid in pids():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        reap()
+        time.sleep(.02)
+    deadline = time.monotonic() + grace
+    while pids() and time.monotonic() < deadline:
+        for pid in pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        reap()
+        time.sleep(.02)
+    reap()
+
+
 # ── Model transport ──────────────────────────────────────────────────────────
 
 def encode_message(message: Message) -> dict:
@@ -734,6 +773,8 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
     finally:
         agent.stop()
         agent.wait(5)
+        if os.getpid() == 1:
+            _shutdown_children()
 
 
 def main() -> None:

@@ -666,6 +666,189 @@ class ModelTests(unittest.TestCase):
         self.assertIn("--model-socket", command)
         self.assertIn("--session-socket", command)
 
+    @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
+    def test_sandbox_shutdown_removes_socket_and_detached_descendants(self):
+        """Namespace teardown must not leave a live daemon or session socket."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            runtime = root / "runtime"
+            workspace.mkdir()
+            runtime.mkdir()
+            endpoint = runtime / "model.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(endpoint))
+            listener.listen()
+
+            code = '''\
+import os, subprocess, sys, time
+graceful = """import pathlib, signal, sys, time
+def stop(_signal, _frame):
+    pathlib.Path('/workspace/terminated').write_text('graceful')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+pathlib.Path('/workspace/graceful-ready').touch()  # GRACEFUL_READY
+time.sleep(300)
+"""
+stubborn = """import pathlib, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path('/workspace/stubborn-ready').touch()
+time.sleep(300)  # STUBBORN_DAEMON
+"""
+double_fork = """import subprocess, sys
+child = ("import pathlib, signal, time; "
+         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "pathlib.Path('/workspace/double-ready').touch(); "
+         "time.sleep(300)  # DOUBLE_FORK_DAEMON")
+subprocess.Popen([sys.executable, '-c', child], start_new_session=True,
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                 stderr=subprocess.DEVNULL)
+"""
+processes = [
+    subprocess.Popen([sys.executable, "-c", graceful], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL),
+    subprocess.Popen([sys.executable, "-c", stubborn], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL),
+    subprocess.Popen([sys.executable, "-c", double_fork], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL),
+]
+
+child_env = {key: value for key, value in os.environ.items()
+             if key != 'EKO_SESSION'}
+child_input, child_hold = os.pipe()
+processes.append(subprocess.Popen(
+    [sys.executable, os.environ['EKO_AGENT'], '--cwd', '/workspace',
+     '--name', 'CLEANUP_CHILD', '--session-socket', '/tmp/cleanup-child.sock'],
+    start_new_session=True, stdin=child_input, stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL, env=child_env, pass_fds=(child_hold,)))
+os.close(child_input)
+os.close(child_hold)
+
+nested = """import pathlib, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path('/workspace/nested-ready').touch()
+time.sleep(300)  # NESTED_SANDBOX_DAEMON
+"""
+processes.append(subprocess.Popen([
+    'bwrap', '--new-session', '--as-pid-1', '--unshare-user', '--unshare-pid',
+    '--ro-bind', '/', '/', '--bind', '/workspace', '/workspace',
+    '--proc', '/proc', '/usr/bin/python3', '-c', nested],
+    start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL))
+
+deadline = time.monotonic() + 5
+while not os.path.exists('/tmp/cleanup-child.sock') and time.monotonic() < deadline:
+    time.sleep(.02)
+if os.path.exists('/tmp/cleanup-child.sock'):
+    open('/workspace/child-ready', 'w').close()
+print("DAEMONS", *(process.pid for process in processes))
+'''
+
+            stopping = threading.Event()
+            clients = []
+
+            def model_client(connection):
+                with connection, connection.makefile("rb") as reader:
+                    json.loads(reader.readline())  # system prompt
+                    line = reader.readline()
+                    if not line:  # An idle child agent.
+                        return
+                    json.loads(line)  # terminal input
+                    response = eko.Message(
+                        "assistant", (eko.Text(f"```python-run\n{code}```"),))
+                    connection.sendall((json.dumps({
+                        "message": eko.encode_message(response),
+                    }) + "\n").encode())
+                    json.loads(reader.readline())  # Python result
+                    response = eko.Message("assistant", (eko.Text("<done/>"),))
+                    connection.sendall((json.dumps({
+                        "message": eko.encode_message(response),
+                    }) + "\n").encode())
+                    reader.readline()
+
+            def model_service():
+                listener.settimeout(.1)
+                while not stopping.is_set():
+                    try:
+                        connection, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        return
+                    client = threading.Thread(
+                        target=model_client, args=(connection,))
+                    client.start()
+                    clients.append(client)
+
+            server = threading.Thread(target=model_service)
+            server.start()
+            agent = host.AgentProcess(host._agent_command(
+                workspace, runtime, sandbox=True, feral=False, name="Eko"))
+            events = []
+            agent.observer = events.append
+            try:
+                self.assertTrue(agent.ready.wait(10))
+                self.assertIsNone(agent.proc.poll())
+                agent.send("start a detached process")
+                wait_until(lambda: any(event.type == "result" for event in events),
+                           timeout=10)
+                result = next(event.value for event in events
+                              if event.type == "result")
+                ready = ("graceful-ready", "stubborn-ready", "double-ready",
+                         "child-ready", "nested-ready")
+                deadline = time.monotonic() + 10
+                while (not all((workspace / name).exists() for name in ready)
+                       and time.monotonic() < deadline):
+                    time.sleep(.02)
+                missing = [name for name in ready
+                           if not (workspace / name).exists()]
+                self.assertEqual(missing, [], result.output)
+
+                def descendants(pid):
+                    found = []
+                    pending = [pid]
+                    while pending:
+                        parent = pending.pop()
+                        path = Path(f"/proc/{parent}/task/{parent}/children")
+                        try:
+                            children = [int(item) for item in path.read_text().split()]
+                        except OSError:
+                            children = []
+                        found.extend(children)
+                        pending.extend(children)
+                    return found
+
+                descendants_before_stop = descendants(agent.proc.pid)
+                commands = b"\n".join(
+                    Path(f"/proc/{pid}/cmdline").read_bytes()
+                    for pid in descendants_before_stop
+                    if Path(f"/proc/{pid}/cmdline").exists())
+                for marker in (b"GRACEFUL_READY", b"STUBBORN_DAEMON",
+                               b"DOUBLE_FORK_DAEMON", b"CLEANUP_CHILD",
+                               b"NESTED_SANDBOX_DAEMON"):
+                    self.assertIn(marker, commands)
+                self.assertTrue((runtime / "session.sock").exists())
+
+                agent.stop()
+
+                wait_until(lambda: all(not Path(f"/proc/{pid}").exists()
+                                       for pid in descendants_before_stop),
+                           timeout=5)
+                self.assertEqual((workspace / "terminated").read_text(),
+                                 "graceful")
+                self.assertFalse((runtime / "session.sock").exists())
+                self.assertEqual(agent.proc.returncode, 0)
+            finally:
+                agent.stop()
+                stopping.set()
+                listener.close()
+                server.join(5)
+                for client in clients:
+                    client.join(5)
+
     def test_close_tolerates_concurrent_interrupt_clearing_process(self):
         model = host.Claude(Path.cwd(), "fake", "low")
         stdout = io.BytesIO()
