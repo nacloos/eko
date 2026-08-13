@@ -77,8 +77,6 @@ NUDGE = "Write a fenced ```python-run block, or <done/> if the prompt is resolve
 FERAL_NUDGE = "Write a fenced ```python-run block."
 NORMAL_MODE = (" If no action is needed, answer directly. When the prompt is "
                "fully resolved, end with <done/> and no Python block.")
-FERAL_MODE = ("\n\nFeral mode: the user is gone; inputs come from Python or other "
-              "processes.")
 MAX_INPUT_TEXT = 20_000
 TIMEOUT = 600
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -165,7 +163,7 @@ class Eko:
         self.feral = feral
         self.observer = observer or (lambda _event: None)
         self.model = model
-        mode = FERAL_MODE if feral else NORMAL_MODE
+        mode = "" if feral else NORMAL_MODE
         self.system = SYSTEM.format(
             name=name, folder=self.cwd, mode=mode)
         self.messages: list[Message] = []
@@ -195,6 +193,8 @@ class Eko:
         self.model.start(self.system)
         if prompt:
             self.send(prompt)
+        elif self.feral:
+            self.inbox.put(Input(HARNESS, (Text("Begin."),)))
         self.listener_thread.start()
         self.thread.start()
 

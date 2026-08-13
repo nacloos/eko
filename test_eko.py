@@ -292,6 +292,18 @@ class EkoTests(unittest.TestCase):
         self.assertIn("You are Eko.", agent.model.system)
         self.stop(agent)
 
+    def test_feral_agent_starts_without_a_prompt(self):
+        model = FakeModel(lambda *_: "```python-run\nimport time\ntime.sleep(60)\n```")
+        agent = eko.Eko(Path.cwd(), model, feral=True)
+        agent.start()
+        wait_until(lambda: len(agent.messages) == 2)
+
+        self.assertNotIn("Feral mode", model.system)
+        self.assertEqual(
+            eko.message_text(agent.messages[0]), "[harness]\nBegin."
+        )
+        self.stop(agent)
+
     def test_terminal_input_is_limited_before_the_model(self):
         agent, _ui = self.agent(lambda *_: "<done/>")
         agent.start("a" * (eko.MAX_INPUT_TEXT + 100))

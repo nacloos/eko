@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-eko = "eko:main"
+eko = "host:main"
 
 [tool.setuptools]
-py-modules = ["eko"]
+py-modules = ["eko", "host"]
