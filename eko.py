@@ -42,6 +42,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -75,7 +76,8 @@ You are in {folder}.
 
 Write a fenced ```python block to act. After your response ends, it runs in that
 folder and its output arrives in a later user message inside <python_result> tags.
-Never write or predict those tags yourself.{mode}
+Never write or predict those tags yourself. A detached process can send you a later
+message by writing a UTF-8 Unix datagram to os.environ["EKO_CALLBACK_SOCKET"].{mode}
 """
 
 NUDGE = "Write a fenced ```python block, or <done/> if the prompt is resolved."
@@ -151,7 +153,8 @@ def clipped(text: str, limit: int = MAX_OUTPUT) -> str:
     return f"{text[:half]}\n\n… {omitted:,} characters omitted …\n\n{text[-half:]}"
 
 
-def run_python(code: str, cwd: Path, interrupted: threading.Event) -> Result:
+def run_python(code: str, cwd: Path, interrupted: threading.Event, *,
+               env: dict[str, str] | None = None) -> Result:
     """Run one model-written Python block in the persistent working folder."""
     python = cwd / ".venv/bin/python"
     executable = str(python if python.exists() else Path(sys.executable))
@@ -159,7 +162,7 @@ def run_python(code: str, cwd: Path, interrupted: threading.Event) -> Result:
     proc = subprocess.Popen(
         [executable, "-u", "-c", code], cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        errors="replace", start_new_session=True)
+        errors="replace", start_new_session=True, env=env)
     deadline = started + TIMEOUT
     while True:
         try:
@@ -922,13 +925,32 @@ class Session:
         self.stopping = threading.Event()
         self.interrupted = threading.Event()
         self.state = "idle"
+        self.callback_path = Path("/tmp") / f"eko-{uuid.uuid4().hex}.sock"
+        self.callback = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.callback.bind(str(self.callback_path))
+        self.callback.settimeout(.5)
+        self.callback_thread = threading.Thread(
+            target=self._listen_for_callbacks, daemon=True)
         self.thread = threading.Thread(
             target=run_session, args=(self,), daemon=True)
 
     def start(self, prompt: str | None = None) -> None:
         if prompt:
             self.followups.put(prompt)
+        self.callback_thread.start()
         self.thread.start()
+
+    def _listen_for_callbacks(self) -> None:
+        """Forward local datagrams from background jobs into the model loop."""
+        while not self.stopping.is_set():
+            try:
+                data = self.callback.recv(64 * 1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if message := data.decode("utf-8", errors="replace").strip():
+                self.submit(message)
 
     def submit(self, message: str) -> None:
         if self.state == "idle":
@@ -948,6 +970,11 @@ class Session:
         self.interrupted.set()
         self.followups.put(None)
         self.llm.interrupt()
+        self.callback.close()
+        try:
+            self.callback_path.unlink()
+        except FileNotFoundError:
+            pass
 
     def status(self) -> str:
         pending = len(self.pending())
@@ -992,7 +1019,9 @@ class Session:
         with self.ui.activity("running"):
             if self.executor is not None:
                 return self.executor(code, self.interrupted)
-            return run_python(code, self.cwd, self.interrupted)
+            env = os.environ.copy()
+            env["EKO_CALLBACK_SOCKET"] = str(self.callback_path)
+            return run_python(code, self.cwd, self.interrupted, env=env)
 
     def show_result(self, result: Result) -> None:
         self.ui.result(result)

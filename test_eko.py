@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -268,6 +269,63 @@ class SessionTests(unittest.TestCase):
         wait_until(lambda: len(session.llm.messages) == 2)
         wait_until(lambda: session.state == "idle")
         self.assertEqual(ui.results[0].output, "done\n")
+        self.stop(session)
+
+    def test_detached_python_can_send_a_later_model_message(self):
+        callback = "background job finished"
+
+        def replies(message, cancelled):
+            if message == "start":
+                return """```python
+import os, socket, subprocess, sys
+code = '''
+import os, socket, time
+time.sleep(.2)
+client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+client.connect(os.environ["EKO_CALLBACK_SOCKET"])
+client.sendall(b"background job finished")
+'''
+subprocess.Popen(
+    [sys.executable, "-c", code],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+print("started")
+```"""
+            if message.startswith("<python_result>"):
+                return "foreground turn finished<done/>"
+            self.assertEqual(message, callback)
+            return "callback received<done/>"
+
+        session, ui = self.session(replies)
+        session.start("start")
+        wait_until(lambda: callback in session.llm.messages)
+        wait_until(lambda: session.state == "idle")
+        self.assertEqual(session.llm.messages[-1], callback)
+        self.assertEqual(ui.results[0].output, "started\n")
+        self.stop(session)
+
+    def test_callback_while_busy_joins_the_next_model_message(self):
+        release = threading.Event()
+
+        def replies(message, cancelled):
+            if message == "busy":
+                release.wait(2)
+                return "done<done/>"
+            return "callback handled<done/>"
+
+        session, ui = self.session(replies)
+        session.start("busy")
+        wait_until(lambda: session.state == "thinking")
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        client.connect(str(session.callback_path))
+        client.sendall(b"arrived while busy")
+        client.close()
+        wait_until(lambda: session.pending() == ["arrived while busy"])
+        release.set()
+        wait_until(lambda: session.llm.messages == ["busy", "arrived while busy"])
         self.stop(session)
 
 
