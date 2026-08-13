@@ -539,13 +539,39 @@ def _limit_input(incoming: Input, limit: int = MAX_INPUT_TEXT) -> Input:
 
 
 def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
-               env: dict[str, str] | None = None) -> Result:
+               env: dict[str, str] | None = None,
+               sandbox: bool = False) -> Result:
     """Run one model-written Python block in the persistent working folder."""
     python = cwd / ".venv/bin/python"
     executable = str(python if python.exists() else Path(sys.executable))
+    command = [executable, "-u", "-c", code]
+    if sandbox:
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            raise RuntimeError("--sandbox requires Bubblewrap (bwrap)")
+        session = Path((env or {})["EKO_SESSION"])
+        sandbox_python = ("/workspace/.venv/bin/python" if python.exists()
+                          else "/usr/bin/python3")
+        command = [
+            bwrap, "--die-with-parent", "--clearenv",
+            "--unshare-user", "--unshare-ipc", "--unshare-uts",
+            "--unshare-cgroup", "--unshare-net",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--symlink", "usr/sbin", "/sbin",
+            "--bind", str(cwd), "/workspace",
+            "--dev", "/dev", "--tmpfs", "/tmp",
+            "--dir", "/run", "--ro-bind", str(session), "/run/eko.sock",
+            "--setenv", "HOME", "/workspace", "--setenv", "TMPDIR", "/tmp",
+            "--setenv", "PATH", "/usr/bin:/bin",
+            "--setenv", "EKO_SESSION", "/run/eko.sock",
+            "--chdir", "/workspace", sandbox_python, "-u", "-c", code,
+        ]
     started = time.monotonic()
     proc = subprocess.Popen(
-        [executable, "-u", "-c", code], cwd=cwd, stdin=subprocess.DEVNULL,
+        command, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         errors="replace", start_new_session=True, env=env)
     deadline = started + TIMEOUT
@@ -1248,16 +1274,25 @@ def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
         effort: str = "high", feral: bool = False,
         executor: Callable[[str, threading.Event], Result] | None = None,
         name: str = NAME, folder: str | Path | None = None,
-        headless: bool = False, socket_path: Path | None = None) -> None:
+        headless: bool = False, socket_path: Path | None = None,
+        sandbox: bool = False) -> None:
     """Run Eko with a TUI or as a plain process controlled by its session socket."""
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
+    if sandbox and executor is not None:
+        raise ValueError("sandbox and a custom executor are mutually exclusive")
     ensure_auth()
-    llm = Claude(cwd, model, effort, feral, name, folder)
+    llm = Claude(cwd, model, effort, feral, name,
+                 "/workspace" if sandbox and folder is None else folder)
+    agent = Eko(cwd, llm, feral, executor=executor, socket_path=socket_path,
+                observer=print_event if headless else None)
+    if sandbox:
+        env = os.environ.copy()
+        env["EKO_SESSION"] = str(agent.socket_path)
+        agent.executor = lambda code, interrupted: _run_python(
+            code, cwd, interrupted, env=env, sandbox=True)
     if headless:
-        agent = Eko(cwd, llm, feral, executor=executor,
-                    socket_path=socket_path, observer=print_event)
         print(f"EKO_SESSION={agent.socket_path}", flush=True)
         agent.start(prompt)
         try:
@@ -1272,7 +1307,6 @@ def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
     ui.header(cwd, model, name)
     if prompt:
         ui.user(prompt)
-    agent = Eko(cwd, llm, feral, executor=executor, socket_path=socket_path)
     ui.connect(agent)
 
     def exit_app() -> None:
@@ -1299,6 +1333,8 @@ def main() -> None:
     parser.add_argument("--name", default=NAME)
     parser.add_argument("--headless", action="store_true",
                         help="run without the terminal UI")
+    parser.add_argument("--sandbox", action="store_true",
+                        help="run generated Python in a Bubblewrap sandbox")
     parser.add_argument("--session-socket", type=Path,
                         help="path for the JSON-lines session socket")
     parser.add_argument(
@@ -1311,8 +1347,9 @@ def main() -> None:
         parser.error(f"not a directory: {cwd}")
     try:
         run(cwd, args.prompt, model=args.model, effort=args.effort, feral=args.feral,
-            name=args.name, headless=args.headless, socket_path=args.session_socket)
-    except ValueError as error:
+            name=args.name, headless=args.headless, socket_path=args.session_socket,
+            sandbox=args.sandbox)
+    except (RuntimeError, ValueError) as error:
         parser.error(str(error))
 
 

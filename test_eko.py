@@ -488,6 +488,15 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(model.cwd, Path("/host/private"))
         self.assertEqual(model.folder, "/workspace")
 
+    def test_sandbox_hides_host_location_from_model(self):
+        agent = mock.Mock(socket_path=Path("/tmp/session.sock"))
+        with mock.patch.object(eko, "ensure_auth"), \
+             mock.patch.object(eko, "Claude") as claude, \
+             mock.patch.object(eko, "Eko", return_value=agent):
+            eko.run(Path.cwd(), headless=True, sandbox=True)
+
+        self.assertEqual(claude.call_args.args[-1], "/workspace")
+
     def test_close_tolerates_concurrent_interrupt_clearing_process(self):
         model = eko.Claude(Path.cwd(), "fake", "low")
         stdout = io.BytesIO()
