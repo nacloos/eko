@@ -1,16 +1,13 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = [
-#     "prompt-toolkit>=3.0,<4",
-#     "rich>=13,<15",
-# ]
+# dependencies = []
 # ///
 
-"""Eko is a coding agent with almost no harness: an LLM, Python, and a persistent folder.
+"""A coding agent with almost no harness: an LLM, Python, and a folder.
 
-    uv run eko.py
-    uv run eko.py --cwd ~/projects/my-project "Find and fix a bug"
-    uv run eko.py --feral "Keep improving this project"
+``Eko`` is the embeddable agent. This file can also run it as a child process:
+
+    EKO_MODEL=/path/to/model.sock python eko.py --cwd /path/to/project
 
 The whole agent is essentially:
 
@@ -27,20 +24,17 @@ The whole agent is essentially:
 Python is the only tool built into the harness. Through it, the model can inspect
 the folder, use the shell, and write its own tools.
 
-The loop only needs access to an LLM. This version uses Tinker's native Cookbook
-renderer and sampling client, with generated Python as the model's only action.
+The process interface reads commands from stdin, writes events to stdout, and
+uses a model conversation through a JSON-lines Unix socket. It has no provider or
+presentation dependencies.
 """
 from __future__ import annotations
 
-import argparse
 import base64
-import io
 import json
 import os
 import queue
 import re
-import select
-import shutil
 import signal
 import socket
 import struct
@@ -48,28 +42,10 @@ import subprocess
 import sys
 import threading
 import time
-import tempfile
-import tokenize
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol
-
-from prompt_toolkit import Application
-from prompt_toolkit.application import run_in_terminal
-from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import ANSI
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
-from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import TextArea
-from rich.console import Console, Group
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.syntax import Syntax
-from rich.text import Text as RichText
-
+from typing import Callable
 
 NAME = "Eko"
 SYSTEM = """You are {name}.
@@ -82,7 +58,7 @@ After your response ends, it runs in that folder. Its combined output returns in
 
 All incoming information is sent to you as user-role messages. A message may contain
 multiple sections, each beginning with a harness-written provenance header.
-[terminal] is text entered by a terminal user. [python exit=N] is output from your
+[terminal] is text entered by a controlling user. [python exit=N] is output from your
 executed Python, where N is its exit status. [process-PID] is text or images sent by
 a local process. [harness] is operational guidance. Never predict the contents of
 these sections yourself.
@@ -105,11 +81,13 @@ TIMEOUT = 600
 MAX_MESSAGE = 16 * 1024 * 1024
 MAX_IMAGE = 5 * 1024 * 1024
 MAX_IMAGES = 20
+ACTIVE_CHILDREN: set[int] = set()
+CHILDREN_LOCK = threading.Lock()
 
 
 # ── Core agent ────────────────────────────────────────────────────────────────
 
-@dataclass
+@dataclass(frozen=True)
 class Result:
     """Completed execution of one model-written Python program."""
 
@@ -167,15 +145,6 @@ PYTHON = "python"
 HARNESS = "harness"
 
 
-class Completer(Protocol):
-    """A stateless message completion capability."""
-
-    def complete(self, messages: tuple[Message, ...],
-                 on_text: Callable[[str], None]) -> Message: ...
-    def interrupt(self) -> None: ...
-    def close(self) -> None: ...
-
-
 class Eko:
     """A running model conversation with an inbox and Python executor.
 
@@ -185,15 +154,17 @@ class Eko:
     this agent without access to its model credentials or internal state.
     """
 
-    def __init__(self, cwd: Path, completer: Completer, feral: bool = False,
-                 executor: Callable[[str, threading.Event], Result] | None = None,
+    def __init__(self, cwd: Path, model, feral: bool = False,
                  socket_path: Path | None = None,
-                 observer: Callable[[Event], None] | None = None) -> None:
-        self.cwd = cwd
+                 observer: Callable[[Event], None] | None = None,
+                 name: str = NAME) -> None:
+        self.cwd = cwd.resolve()
         self.feral = feral
-        self.executor = executor
         self.observer = observer or (lambda _event: None)
-        self.completer = completer
+        self.model = model
+        mode = FERAL_MODE if feral else NORMAL_MODE
+        self.system = SYSTEM.format(
+            name=name, folder=self.cwd, mode=mode)
         self.messages: list[Message] = []
         self.inbox: queue.Queue[Input | None] = queue.Queue()
         self.stopping = threading.Event()
@@ -218,13 +189,14 @@ class Eko:
         self.listener.settimeout(.2)
         self.listener_thread = threading.Thread(target=self._listen, daemon=True)
         self.thread = threading.Thread(target=self._run, daemon=True)
+        self.model.start(self.system)
         if prompt:
             self.send(prompt)
         self.listener_thread.start()
         self.thread.start()
 
     def send(self, incoming: Input | str) -> None:
-        """Put attributed input—or convenient terminal text—into the inbox."""
+        """Put attributed input—or convenient controlling-user text—into the inbox."""
         if isinstance(incoming, str):
             incoming = Input(TERMINAL, (Text(incoming),))
         self.inbox.put(incoming)
@@ -235,7 +207,7 @@ class Eko:
             return
         self.interrupted.set()
         if self.state == "thinking":
-            self.completer.interrupt()
+            self.model.interrupt()
 
     def stop(self) -> None:
         """Stop accepting work and release the model, listener, and socket path."""
@@ -244,21 +216,26 @@ class Eko:
         self.stopping.set()
         self.interrupted.set()
         self.inbox.put(None)
-        self.completer.interrupt()
+        self.model.interrupt()
         if self.listener is not None:
             self.listener.close()
         self.socket_path.unlink(missing_ok=True)
 
     def wait(self, timeout: float | None = None) -> None:
-        """Wait for the agent thread to finish."""
+        """Wait for the agent loop and its inbox listener to finish."""
         if self.thread is not None:
             self.thread.join(timeout)
+        if (self.listener_thread is not None
+                and self.listener_thread is not threading.current_thread()):
+            self.listener_thread.join(timeout)
 
     def status(self) -> str:
-        pending = len(self.pending())
-        return self.state + (f" · {pending} pending" if pending else "")
+        """Describe current and queued work for an observer."""
+        queued = len(self.pending())
+        return self.state + (f" · {queued} pending" if queued else "")
 
     def pending(self) -> list[str]:
+        """Return short descriptions of inputs waiting behind active work."""
         with self.inbox.mutex:
             events = [event for event in self.inbox.queue if event is not None]
         return [next((part.text for part in event.content
@@ -297,8 +274,6 @@ class Eko:
 
     def _execute(self, code: str) -> Result:
         self._set_state("running Python")
-        if self.executor is not None:
-            return self.executor(code, self.interrupted)
         env = os.environ.copy()
         env["EKO_SESSION"] = str(self.socket_path)
         return _run_python(code, self.cwd, self.interrupted, env=env)
@@ -314,21 +289,21 @@ class Eko:
                         return
                 try:
                     self._set_state("thinking")
-                    message = _user_message(tuple(
-                        _limit_input(incoming) for incoming in inputs))
-                    reply = self.completer.complete(
-                        (*self.messages, message),
+                    message = user_message(tuple(
+                        limit_input(incoming) for incoming in inputs))
+                    reply = self.model.send(
+                        message,
                         lambda text: self._emit(Event("delta", text)))
                     if reply.role != "assistant":
-                        raise ValueError("completer must return an assistant message")
-                    response = _message_text(reply)
+                        raise ValueError("model must return an assistant message")
+                    response = message_text(reply)
                     self.messages.extend((message, reply))
                     predicted = any(
                         kind == "prose" and re.search(
                             r"(?m)^\[(?:terminal|python(?: exit=-?\d+)?|"
                             r"process-\d+|harness)\]\s*$", text)
                         for kind, text, _closed in response_segments(response))
-                    code = _python(response)
+                    code = executable_python(response)
                     self._emit(Event("response", (response, code)))
 
                     if code is None and "<done/>" in response and not self.feral:
@@ -361,7 +336,7 @@ class Eko:
                     self._emit(Event("error", str(error)))
                     inputs = None
         finally:
-            self.completer.close()
+            self.model.close()
 
     # External processes use the same inbox through a small JSON-lines socket.
     def _listen(self) -> None:
@@ -392,7 +367,7 @@ class Eko:
                     message = json.loads(line)
                     kind = message.get("type")
                     if kind == "input":
-                        self.send(_parse_input(message, source, self.cwd))
+                        self.send(decode_input(message, source, self.cwd))
                     elif kind == "interrupt":
                         self.interrupt()
                     else:
@@ -402,7 +377,7 @@ class Eko:
             except Exception as error:
                 self._emit(Event("error", f"Agent input rejected: {error}"))
 
-# ── Input and Python details ──────────────────────────────────────────────────
+# ── Input decoding ───────────────────────────────────────────────────────────
 
 IMAGE_TYPES = {
     b"\x89PNG\r\n\x1a\n": "image/png",
@@ -420,7 +395,7 @@ def _image_type(data: bytes) -> str | None:
     return kind
 
 
-def _parse_input(message: dict, source: str, cwd: Path) -> Input:
+def decode_input(message: dict, source: str, cwd: Path) -> Input:
     """Validate untrusted socket JSON and normalize it into an ``Input``.
 
     Images may be inline base64 or workspace-relative paths. The caller supplies
@@ -468,16 +443,18 @@ def _parse_input(message: dict, source: str, cwd: Path) -> Input:
     return Input(source, tuple(content))
 
 
+# ── Response and conversation encoding ───────────────────────────────────────
+
 OPEN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,})[ \t]*python-run[ \t]*$")
 
 
-def _opening_fence(line: str) -> int:
+def opening_fence(line: str) -> int:
     """Return the backtick count for an executable Python fence."""
     match = OPEN_FENCE.fullmatch(line.rstrip("\r\n"))
     return len(match.group(1)) if match else 0
 
 
-def _closing_fence(line: str, length: int) -> bool:
+def closing_fence(line: str, length: int) -> bool:
     """Whether this complete line closes a fence of ``length`` backticks."""
     return bool(re.fullmatch(
         rf"[ \t]{{0,3}}`{{{length},}}[ \t]*", line.rstrip("\r\n")))
@@ -490,14 +467,14 @@ def response_segments(text: str) -> list[tuple[str, str, bool]]:
     fence = 0
     for line in text.splitlines(keepends=True):
         if not fence:
-            if length := _opening_fence(line):
+            if length := opening_fence(line):
                 if parts:
                     segments.append(("prose", "".join(parts), True))
                     parts = []
                 fence = length
             else:
                 parts.append(line)
-        elif _closing_fence(line, fence):
+        elif closing_fence(line, fence):
             segments.append(("python", "".join(parts), True))
             parts = []
             fence = 0
@@ -508,21 +485,13 @@ def response_segments(text: str) -> list[tuple[str, str, bool]]:
     return segments
 
 
-def _python(text: str) -> str | None:
+def executable_python(text: str) -> str | None:
     blocks = [content for kind, content, closed in response_segments(text)
               if kind == "python" and closed]
     return "\n".join(blocks) if blocks else None
 
 
-def _clip(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    half = limit // 2
-    omitted = len(text) - limit
-    return f"{text[:half]}\n\n… {omitted:,} characters omitted …\n\n{text[-half:]}"
-
-
-def _limit_input(incoming: Input, limit: int = MAX_INPUT_TEXT) -> Input:
+def limit_input(incoming: Input, limit: int = MAX_INPUT_TEXT) -> Input:
     """Limit all text in one input while preserving its multimodal order."""
     total = sum(len(part.text) for part in incoming.content
                 if isinstance(part, Text))
@@ -555,7 +524,7 @@ def _limit_input(incoming: Input, limit: int = MAX_INPUT_TEXT) -> Input:
     return Input(incoming.source, tuple(content), incoming.returncode)
 
 
-def _user_message(inputs: tuple[Input, ...]) -> Message:
+def user_message(inputs: tuple[Input, ...]) -> Message:
     """Combine attributed inputs into one provider-neutral user message."""
     content: list[Content] = []
     for index, incoming in enumerate(inputs):
@@ -568,10 +537,12 @@ def _user_message(inputs: tuple[Input, ...]) -> Message:
     return Message("user", tuple(content))
 
 
-def _message_text(message: Message) -> str:
+def message_text(message: Message) -> str:
     """Return the text of a message in content order."""
     return "".join(part.text for part in message.content if isinstance(part, Text))
 
+
+# ── Python execution ─────────────────────────────────────────────────────────
 
 def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
                env: dict[str, str] | None = None) -> Result:
@@ -579,955 +550,209 @@ def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
     python = cwd / ".venv/bin/python"
     executable = str(python if python.exists() else Path(sys.executable))
     started = time.monotonic()
-    proc = subprocess.Popen(
-        [executable, "-u", "-c", code], cwd=cwd, stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        errors="replace", start_new_session=True, env=env)
-    deadline = started + TIMEOUT
-    while True:
-        try:
-            output, _ = proc.communicate(timeout=.1)
-            break
-        except subprocess.TimeoutExpired:
-            if interrupted.is_set() or time.monotonic() >= deadline:
-                os.killpg(proc.pid, signal.SIGKILL)
-                output, _ = proc.communicate()
-                reason = ("Interrupted" if interrupted.is_set()
-                          else f"TIMEOUT after {TIMEOUT}s")
-                output += f"\n{reason}"
+    with CHILDREN_LOCK:
+        proc = subprocess.Popen(
+            [executable, "-u", "-c", code], cwd=cwd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            errors="replace", start_new_session=True, env=env)
+        ACTIVE_CHILDREN.add(proc.pid)
+    try:
+        deadline = started + TIMEOUT
+        while True:
+            try:
+                output, _ = proc.communicate(timeout=.1)
                 break
+            except subprocess.TimeoutExpired:
+                if interrupted.is_set() or time.monotonic() >= deadline:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    output, _ = proc.communicate()
+                    reason = ("Interrupted" if interrupted.is_set()
+                              else f"TIMEOUT after {TIMEOUT}s")
+                    output += f"\n{reason}"
+                    break
+    finally:
+        with CHILDREN_LOCK:
+            ACTIVE_CHILDREN.discard(proc.pid)
     return Result(output, proc.returncode, time.monotonic() - started)
 
 
-SANDBOX_INIT = r'''import json
-import os
-import select
-import signal
-import subprocess
-import sys
-import threading
-import time
-
-os.unlink("/run/worker.py")
-
-def drain(stream, chunks):
+def _reap_children() -> None:
+    """Reap orphaned background processes when Eko is namespace PID 1."""
+    children = Path("/proc/1/task/1/children")
     while True:
-        chunk = stream.read(65536)
-        if not chunk:
+        try:
+            pids = [int(pid) for pid in children.read_text().split()]
+        except OSError:
             return
-        chunks.append(chunk)
-
-print(json.dumps({"ready": True}), flush=True)
-for line in sys.stdin:
-    try:
-        request = json.loads(line)
-        if request.get("op") != "python":
-            raise ValueError("expected Python")
-        started = time.monotonic()
-        process = subprocess.Popen(
-            [request["python"], "-u", "-c", request["code"]], cwd="/workspace",
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, start_new_session=True)
-        chunks = []
-        reader = threading.Thread(
-            target=drain, args=(process.stdout, chunks), daemon=True)
-        reader.start()
-        timeout = float(request["timeout"])
-        deadline = started + timeout
-        cancelled = False
-        while process.poll() is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                cancelled = True
-                break
-            ready, _, _ = select.select([sys.stdin], [], [], min(.1, remaining))
-            if ready:
-                control = json.loads(sys.stdin.readline())
-                if control.get("op") == "interrupt":
-                    cancelled = True
-                    break
-        if cancelled and process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        returncode = process.wait()
-        reader.join(timeout=.25)
-        process.stdout.close()
-        text = b"".join(chunks).decode("utf-8", "replace")
-        if cancelled:
-            text += ("\nInterrupted" if time.monotonic() < deadline else
-                     f"\nTIMEOUT after {timeout:g}s")
-        reply = {"output": text, "returncode": returncode,
-                 "elapsed": time.monotonic() - started}
-    except Exception as error:
-        reply = {"output": f"sandbox error: {type(error).__name__}: {error}\n",
-                 "returncode": 1, "elapsed": 0}
-    print(json.dumps(reply, separators=(",", ":")), flush=True)
-'''
+        with CHILDREN_LOCK:
+            for pid in pids:
+                if pid not in ACTIVE_CHILDREN:
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+        time.sleep(.2)
 
 
-class Sandbox:
-    """One persistent Linux namespace for all generated Python actions."""
+# ── Model transport ──────────────────────────────────────────────────────────
 
-    def __init__(self, workspace: Path, session: Path) -> None:
-        self.workspace = workspace
-        self.session = session
-        self.process: subprocess.Popen[str] | None = None
-
-    def start(self) -> None:
-        if self.process is not None:
-            return
-        bwrap = shutil.which("bwrap")
-        if bwrap is None:
-            raise RuntimeError("--sandbox requires Bubblewrap (bwrap)")
-        with tempfile.TemporaryFile() as source:
-            source.write(SANDBOX_INIT.encode())
-            source.seek(0)
-            fd = source.fileno()
-            command = [
-                bwrap, "--die-with-parent", "--new-session", "--clearenv",
-                "--unshare-user", "--unshare-pid", "--unshare-ipc",
-                "--unshare-uts", "--unshare-cgroup", "--unshare-net",
-                "--ro-bind", "/usr", "/usr",
-                "--symlink", "usr/bin", "/bin",
-                "--symlink", "usr/lib", "/lib",
-                "--symlink", "usr/lib64", "/lib64",
-                "--symlink", "usr/sbin", "/sbin",
-                "--dir", "/etc",
-                "--ro-bind", "/etc/alternatives", "/etc/alternatives",
-                "--bind", str(self.workspace), "/workspace",
-                "--ro-bind", str(self.session), "/eko.sock",
-                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-                "--dir", "/run", "--remount-ro", "/", "--tmpfs", "/run",
-                "--file", str(fd), "/run/worker.py",
-                "--setenv", "HOME", "/workspace",
-                "--setenv", "TMPDIR", "/tmp",
-                "--setenv", "LANG", "C.UTF-8",
-                "--setenv", "PATH", "/usr/bin:/bin",
-                "--setenv", "EKO_SESSION", "/eko.sock",
-                "--chdir", "/workspace", "/usr/bin/python3", "-u", "/run/worker.py",
-            ]
-            self.process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, bufsize=1,
-                start_new_session=True, pass_fds=(fd,))
-        assert self.process.stdout is not None
-        ready, _, _ = select.select([self.process.stdout], [], [], 5)
-        line = self.process.stdout.readline() if ready else ""
-        if not line or json.loads(line) != {"ready": True}:
-            detail = (self.process.stderr.read().strip()
-                      if self.process.poll() is not None else "no response")
-            self.close()
-            raise RuntimeError(f"sandbox failed to start: {detail}")
-
-    def execute(self, code: str, interrupted: threading.Event) -> Result:
-        self.start()
-        process = self.process
-        assert process is not None and process.stdin and process.stdout
-        python = ("/workspace/.venv/bin/python"
-                  if (self.workspace / ".venv/bin/python").exists()
-                  else "/usr/bin/python3")
-        process.stdin.write(json.dumps({
-            "op": "python", "code": code, "python": python, "timeout": TIMEOUT},
-            separators=(",", ":")) + "\n")
-        process.stdin.flush()
-        sent = False
-        while process.poll() is None:
-            ready, _, _ = select.select([process.stdout], [], [], .1)
-            if ready:
-                reply = json.loads(process.stdout.readline())
-                return Result(reply["output"], reply["returncode"], reply["elapsed"])
-            if interrupted.is_set() and not sent:
-                process.stdin.write('{"op":"interrupt"}\n')
-                process.stdin.flush()
-                sent = True
-        assert process.stderr is not None
-        raise RuntimeError("sandbox stopped: " + process.stderr.read().strip())
-
-    def close(self) -> None:
-        process, self.process = self.process, None
-        if process is None:
-            return
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=2)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try: os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
-                process.wait()
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-
-
-# ── Claude model connection ───────────────────────────────────────────────────
-
-CALL_TIMEOUT = 300
-
-
-def _claude_content(message: Message) -> list[dict]:
-    """Serialize provider-neutral content as Claude blocks."""
-    blocks: list[dict] = []
+def encode_message(message: Message) -> dict:
+    """Encode a provider-neutral message for the model socket."""
+    content = []
     for part in message.content:
         if isinstance(part, Text):
-            blocks.append({"type": "text", "text": part.text})
+            content.append({"type": "text", "text": part.text})
         else:
-            if part.name:
-                blocks.append({"type": "text", "text": f"Image: {part.name}"})
-            blocks.append({"type": "image", "source": {
-                "type": "base64", "media_type": part.media_type,
-                "data": base64.b64encode(part.data).decode(),
-            }})
-    return blocks
+            content.append({"type": "image", "media_type": part.media_type,
+                            "data": base64.b64encode(part.data).decode(),
+                            "name": part.name})
+    return {"role": message.role, "content": content}
 
 
-class Claude:
-    """A persistent, tool-free connection to the LLM through the Claude CLI.
+def decode_message(raw: dict) -> Message:
+    """Decode one trusted message from the private model socket."""
+    content: list[Content] = []
+    for part in raw["content"]:
+        if part["type"] == "text":
+            content.append(Text(part["text"]))
+        else:
+            content.append(Image(part["media_type"], base64.b64decode(part["data"]),
+                                 part.get("name")))
+    return Message(raw["role"], tuple(content))
 
-    Stream JSON lets several Eko turns share one model conversation. ``--safe-mode``
-    prevents machine-specific instructions, hooks, plugins, and skills from changing
-    the model's context, while ``--tools ''`` leaves generated Python as its only action.
-    """
 
-    def __init__(self, cwd: Path, model: str = "claude-opus-5", effort: str = "high",
-                 feral: bool = False, name: str = NAME,
-                 folder: str | Path | None = None) -> None:
-        self.cwd = cwd
-        self.folder = folder if folder is not None else cwd
-        self.model = model
-        self.effort = effort
-        self.feral = feral
-        self.name = name
-        self.session_id = str(uuid.uuid4())
-        self.proc: subprocess.Popen[bytes] | None = None
-        self.started = False
-        self.interrupted = threading.Event()
+class Model:
+    """One model conversation carried by one Unix socket connection."""
 
-    def _repair_session(self) -> bool:
-        """Repair this session's empty assistant text blocks."""
-        config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
-        projects = config / "projects"
-        if not projects.is_dir():
-            return False
-        for path in projects.glob(f"*/{self.session_id}.jsonl"):
-            lines = path.read_text().splitlines(keepends=True)
-            changed = False
-            for index, line in enumerate(lines):
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("type") != "assistant":
-                    continue
-                content = record.get("message", {}).get("content", [])
-                repaired = False
-                for block in content:
-                    if block.get("type") == "text" and block.get("text") == "":
-                        block["text"] = " "
-                        repaired = changed = True
-                if repaired:
-                    ending = "\n" if line.endswith("\n") else ""
-                    lines[index] = json.dumps(record, separators=(",", ":")) + ending
-            if changed:
-                temporary = path.with_suffix(".jsonl.tmp")
-                temporary.write_text("".join(lines))
-                os.replace(temporary, path)
-                return True
-        return False
+    def __init__(self, endpoint: Path) -> None:
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.connect(str(endpoint))
+        self.reader = self.socket.makefile("rb")
+        self.write_lock = threading.Lock()
 
-    def _start(self) -> None:
-        session = (["--resume", self.session_id] if self.started else
-                   ["--session-id", self.session_id])
-        command = [
-            "claude", "-p", "--verbose", "--safe-mode", "--tools", "",
-            "--model", self.model, "--effort", self.effort,
-            *session,
-            "--input-format", "stream-json", "--output-format", "stream-json",
-            "--include-partial-messages",
-            "--system-prompt", SYSTEM.format(
-                name=self.name, folder=self.folder,
-                mode=FERAL_MODE if self.feral else NORMAL_MODE),
-        ]
-        self.proc = subprocess.Popen(
-            command, cwd=self.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
-        self.started = True
+    def _send(self, value: dict) -> None:
+        with self.write_lock:
+            self.socket.sendall((json.dumps(value, separators=(",", ":")) + "\n").encode())
 
-    def _terminate(self, signum: int, grace: float = 2) -> None:
-        """Signal the CLI process group and ensure it is collected."""
-        if self.proc is None:
-            return
-        if self.proc.poll() is None:
-            try:
-                os.killpg(self.proc.pid, signum)
-            except ProcessLookupError:
-                pass
-            try:
-                self.proc.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.proc.wait()
-        self.proc = None
+    def start(self, system: str) -> None:
+        self._send({"system": system})
 
-    def complete(self, messages: tuple[Message, ...], on_text: Callable[[str], None],
-                 deadline: float | None = None,
-                 retry_delay: float = .2) -> Message:
-        """Complete a history using the CLI's internally persisted conversation."""
-        if not messages or messages[-1].role != "user":
-            raise ValueError("conversation must end with a user message")
-        self.interrupted.clear()
-        deadline = deadline or time.monotonic() + CALL_TIMEOUT
-        resuming = self.started
-        if self.proc is None or self.proc.poll() is not None:
-            self._start()
-        proc = self.proc
-        assert proc is not None and proc.stdin and proc.stdout
-        event = {"type": "user", "message": {
-            "role": "user", "content": _claude_content(messages[-1])}}
-        proc.stdin.write((json.dumps(event) + "\n").encode())
-        proc.stdin.flush()
-
-        parts: list[str] = []
-        complete = ""
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [proc.stdout], [], [], max(0, deadline - time.monotonic()))
-            if not ready:
-                break
-            line = proc.stdout.readline()
-            if not line:
-                if self.interrupted.is_set():
+    def send(self, message: Message,
+             on_text: Callable[[str], None]) -> Message:
+        self._send({"message": encode_message(message)})
+        while line := self.reader.readline():
+            event = json.loads(line)
+            if "delta" in event:
+                on_text(event["delta"])
+            elif "message" in event:
+                return decode_message(event["message"])
+            elif "error" in event:
+                if event.get("interrupted"):
                     raise InterruptedError
-                break
-            if not line.startswith(b"{"):
-                continue
-            data = json.loads(line)
-            if data.get("type") == "stream_event":
-                event = data.get("event", {})
-                delta = event.get("delta", {})
-                if (event.get("type") == "content_block_delta"
-                        and delta.get("type") == "text_delta"):
-                    text = delta.get("text", "")
-                    parts.append(text)
-                    on_text(text)
-            elif data.get("type") == "assistant":
-                complete = "".join(
-                    block["text"] for block in data["message"].get("content", [])
-                    if block.get("type") == "text")
-            elif data.get("type") == "result":
-                if data.get("is_error"):
-                    detail = data.get("result") or data.get("error")
-                    if resuming:
-                        self._terminate(signal.SIGTERM)
-                        proc.stdin.close()
-                        proc.stdout.close()
-                        if ("text content blocks must be non-empty" in str(detail)
-                                and self._repair_session()):
-                            return self.complete(
-                                messages, on_text, deadline, retry_delay)
-                        remaining = deadline - time.monotonic()
-                        if remaining > 0 and not parts and not complete:
-                            delay = min(retry_delay, remaining)
-                            if self.interrupted.wait(delay):
-                                raise InterruptedError
-                            if time.monotonic() < deadline:
-                                return self.complete(
-                                    messages, on_text, deadline,
-                                    min(retry_delay * 2, 5))
-                        raise RuntimeError(
-                            "Model session could not resume; context was not "
-                            f"reset. {detail or ''}".rstrip())
-                    raise RuntimeError(detail or "Model call failed")
-                return Message(
-                    "assistant", (Text(complete or "".join(parts)),))
-        raise RuntimeError("Model produced no result")
-
-    def close(self) -> None:
-        """Give the CLI a brief chance to flush its session, then stop it."""
-        proc = self.proc
-        if proc is None:
-            return
-        if proc.poll() is None:
-            try:
-                assert proc.stdin
-                proc.stdin.close()
-                proc.stdin = None
-                proc.wait(timeout=3)
-            except (BrokenPipeError, subprocess.TimeoutExpired):
-                self._terminate(signal.SIGTERM)
-                return
-        if proc.stdout:
-            proc.stdout.close()
-        if self.proc is proc:
-            self.proc = None
+                raise RuntimeError(event["error"])
+        raise RuntimeError("model service disconnected")
 
     def interrupt(self) -> None:
-        self.interrupted.set()
-        self._terminate(signal.SIGKILL)
-
-
-# ── Claude authentication ─────────────────────────────────────────────────────
-
-def auth_status() -> bool:
-    """Return whether the Claude CLI can access the model."""
-    if shutil.which("claude") is None:
-        raise SystemExit("Claude Code is not installed or is not on PATH.")
-    status = subprocess.run(
-        ["claude", "auth", "status", "--json"], text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if status.returncode:
-        return False
-    try:
-        data = json.loads(status.stdout)
-        return bool(data.get("loggedIn"))
-    except json.JSONDecodeError:
-        return False
-
-
-def ensure_auth() -> None:
-    """Let the official CLI own sign-in; Eko never reads or stores credentials."""
-    if auth_status():
-        return
-    print("Claude Code is not signed in.")
-    answer = input("Press Enter to sign in, or q to exit: ").strip().lower()
-    if answer == "q":
-        raise SystemExit(0)
-    subprocess.run(["claude", "auth", "login", "--claudeai"], check=False)
-    if not auth_status():
-        raise SystemExit("Claude sign-in did not complete.")
-
-
-# ── Terminal rendering ────────────────────────────────────────────────────────
-
-MAX_DISPLAY_OUTPUT = 4_000
-MAX_DISPLAY_LINES = 5
-GOLD = "#d7af5f"
-GOLD_ACTIVE = "#e5bd68"
-
-
-def response_renderable(text: str):
-    """Render executable Python as panels and leave Markdown intact."""
-    text = text.replace("<done/>", "")
-    items = []
-    for kind, content, _closed in response_segments(text):
-        if kind == "prose" and content.strip():
-            items.append(Markdown(content.strip()))
-        elif kind == "python":
-            items.append(Panel(
-                Syntax(content.rstrip("\n") or " ", "python",
-                       theme="ansi_dark", word_wrap=True),
-                title=f"[bold {GOLD}]python[/bold {GOLD}]", title_align="left",
-                border_style=GOLD, padding=(0, 1)))
-    return Group(*items)
-
-
-def display_output(text: str, width: int = 120) -> str:
-    """Make a compact terminal preview while preserving model-facing output."""
-    lines = text.splitlines()
-    if len(lines) > MAX_DISPLAY_LINES:
-        retained = MAX_DISPLAY_LINES - 1
-        head = retained // 2
-        tail = retained - head
-        omitted = len(lines) - retained
-        lines = lines[:head] + [f"… +{omitted} lines"] + lines[-tail:]
-    lines = [line if len(line) <= width else line[:width - 1] + "…"
-             for line in lines]
-    return _clip("\n".join(lines), MAX_DISPLAY_OUTPUT)
-
-
-class NativeStream:
-    """Append stable model-output lines without redrawing terminal history."""
-
-    def __init__(self, ui: UI) -> None:
-        self.ui = ui
-        self.text = ""
-        self.buffer = ""
-        self.pending_output: list[str] = []
-        self.last_flush = time.monotonic()
-        self.code = False
-        self.fence_length = 0
-        self.box_open = False
-        self.prose = ""
-        self.code_lines: list[str] = []
-        self.code_emitted = 0
-
-    def feed(self, delta: str) -> None:
-        self.text += delta
-        self.buffer += delta.replace("\x1b", "")
-        self._drain()
-        if time.monotonic() - self.last_flush >= .1:
-            self._flush()
-
-    def _queue(self, text: str) -> None:
-        self.pending_output.append(text)
-
-    def _flush(self) -> None:
-        if self.pending_output:
-            self.ui._append("".join(self.pending_output))
-            self.pending_output.clear()
-        self.last_flush = time.monotonic()
-
-    def _drain(self, final: bool = False) -> None:
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
-            self._line(line + "\n")
-        if final and self.buffer:
-            line, self.buffer = self.buffer, ""
-            self._line(line)
-        if final:
-            if self.code:
-                self._commit_code(final=True)
-                self._close_box()
-                self.code = False
-            else:
-                self._prose("", final=True)
-
-    def _line(self, line: str) -> None:
-        if self.code:
-            if _closing_fence(line, self.fence_length):
-                self._commit_code(final=True)
-                self._close_box()
-                self.code = False
-                self.fence_length = 0
-            else:
-                self.code_lines.append(line.rstrip("\r\n"))
-                self._commit_code()
-            return
-        if length := _opening_fence(line):
-            self._prose("", final=True)
-            self.code = True
-            self.fence_length = length
-            self._open_box()
-        else:
-            self._prose(line)
-
-    def _prose(self, text: str, final: bool = False) -> None:
-        text = self._visible_prose(text).replace("<done/>", "")
-        self.prose += text
-        # A blank line closes a Markdown block. Keeping only the unfinished
-        # block mutable prevents later tokens from restyling terminal history.
-        while "\n\n" in self.prose:
-            block, self.prose = self.prose.split("\n\n", 1)
-            self._render_prose(block)
-        if final and self.prose:
-            self._render_prose(self.prose)
-            self.prose = ""
-
-    def _visible_prose(self, text: str) -> str:
-        return text
-
-    def _render_prose(self, text: str) -> None:
-        if text.strip():
-            self._queue(self.ui._render(Markdown(text.strip())) + "\n")
-
-    def _width(self) -> int:
-        return max(20, shutil.get_terminal_size().columns - 2)
-
-    def _open_box(self) -> None:
-        self.code_lines = []
-        self.code_emitted = 0
-        width = self._width()
-        title = "─ python "
-        self._queue(self.ui._render(RichText(
-            "╭" + title + "─" * max(0, width - len(title) - 2) + "╮",
-            style=f"bold {GOLD}")))
-        self.box_open = True
-
-    def _stable_code_lines(self) -> int:
-        """Return the prefix whose Python highlighting cannot change later."""
-        source = "\n".join(self.code_lines) + "\n"
-        stable = len(self.code_lines)
         try:
-            list(tokenize.generate_tokens(io.StringIO(source).readline))
-        except (tokenize.TokenError, IndentationError, SyntaxError) as error:
-            location = error.args[1] if len(error.args) > 1 else None
-            if isinstance(location, tuple):
-                stable = min(stable, max(0, location[0] - 1))
-        return stable
+            self._send({"interrupt": True})
+        except OSError:
+            pass
 
-    def _commit_code(self, final: bool = False) -> None:
-        end = len(self.code_lines) if final else self._stable_code_lines()
-        if end <= self.code_emitted:
-            return
-        source = "\n".join(self.code_lines) + "\n"
-        highlighted = Syntax("", "python", theme="ansi_dark").highlight(source)
-        lines = highlighted.split("\n")
-        for line in lines[self.code_emitted:end]:
-            self._code_line(line)
-        self.code_emitted = end
-
-    def _code_line(self, line: RichText) -> None:
-        width = self._width()
-        content = line[:max(1, width - 4)]
-        padding = " " * max(0, width - len(content.plain) - 4)
-        row = RichText()
-        row.append("│ ", style=GOLD)
-        row.append_text(content)
-        row.append(padding)
-        row.append(" │", style=GOLD)
-        self._queue(self.ui._render(row))
-
-    def _close_box(self) -> None:
-        if self.box_open:
-            width = self._width()
-            self._queue(self.ui._render(RichText(
-                "╰" + "─" * (width - 2) + "╯", style=GOLD)))
-            self.box_open = False
-
-    def finish(self) -> None:
-        self._drain(final=True)
-        self._close_box()
-        self._flush()
+    def close(self) -> None:
+        try:
+            self.reader.close()
+        finally:
+            self.socket.close()
 
 
-class UI:
-    """Commit completed messages above a small live composer."""
-
-    def __init__(self) -> None:
-        self.live = ""
-        self.streamed_response = ""
-        self.lock = threading.Lock()
-        self.activity_stop: threading.Event | None = None
-        self.activity_thread: threading.Thread | None = None
-        self.status: Callable[[], str] = lambda: "idle"
-        self.pending: Callable[[], list[str]] = lambda: []
-        self.on_submit: Callable[[str], None] = lambda text: None
-        self.on_interrupt: Callable[[], None] = lambda: None
-        self.on_exit: Callable[[], None] = lambda: None
-        self.on_start: Callable[[], None] = lambda: None
-        self.keys = KeyBindings()
-
-        self.transcript_window = Window(
-            FormattedTextControl(self._transcript), height=1,
-            wrap_lines=False, always_hide_cursor=True)
-        self.composer = TextArea(
-            height=1,
-            prompt=[(f"{GOLD} bold", "› ")],
-            multiline=True, wrap_lines=True)
-        self.status_window = Window(FormattedTextControl(self._status), height=1)
-
-        @self.keys.add("enter")
-        def send(event) -> None:
-            self._submit()
-
-        @self.keys.add("c-c")
-        def cancel(event) -> None:
-            if self.composer.text:
-                self.composer.buffer.set_document(Document("", 0), bypass_readonly=True)
-            else:
-                self.on_interrupt()
-
-        @self.keys.add("c-d")
-        def exit_app(event) -> None:
-            if not self.composer.text:
-                self.on_exit()
-
-        @self.keys.add("escape")
-        def interrupt(event) -> None:
-            self.on_interrupt()
-
-        root = HSplit([
-            self.transcript_window,
-            Window(height=1, char="─", style="class:rule"),
-            self.composer,
-            self.status_window,
-        ])
-        self.app: Application[None] = Application(
-            layout=Layout(root, focused_element=self.composer),
-            key_bindings=self.keys, full_screen=False, mouse_support=False,
-            min_redraw_interval=.04,
-            style=Style.from_dict({
-                "rule": "#444444", "status": "#888888",
-                "pending": "#888888", "pending.label": f"{GOLD} bold",
-            }))
-        self.app.ttimeoutlen = .1
-        self.app.timeoutlen = .1
-
-    def connect(self, agent: Eko) -> None:
-        """Observe an Eko and route terminal controls back to it."""
-        stream = None
-
-        def render(event: Event) -> None:
-            nonlocal stream
-            if event.type == "state":
-                state = str(event.value)
-                if state == "thinking":
-                    self._start_activity("thinking")
-                elif state == "running Python":
-                    self._start_activity("running")
-                else:
-                    self._stop_activity()
-            elif event.type == "delta":
-                if stream is None:
-                    stream = NativeStream(self)
-                stream.feed(str(event.value))
-            elif event.type == "response":
-                self._stop_activity()
-                if stream is not None:
-                    stream.finish()
-                    stream = None
-                response, code = event.value
-                self.streamed_response = response
-                self.assistant(response, code)
-            elif event.type == "result":
-                self._stop_activity()
-                self.result(event.value)
-            elif event.type == "error":
-                self._stop_activity()
-                if stream is not None:
-                    stream.finish()
-                    stream = None
-                self.stopped(str(event.value))
-
-        agent.observer = render
-        self.status = agent.status
-        self.pending = agent.pending
-        self.on_submit = agent.send
-        self.on_interrupt = agent.interrupt
-
-    def _start_activity(self, label: str) -> None:
-        """Show activity until output arrives, without involving the agent core."""
-        self._stop_activity()
-        stopped = self.activity_stop = threading.Event()
-        frames = ("", ".", "..", "...", "..", ".")
-
-        def animate() -> None:
-            frame = 0
-            while not stopped.is_set():
-                rendered = self._render(RichText(
-                    f"{label}{frames[frame % len(frames)]}",
-                    style=f"dim {GOLD_ACTIVE}"))
-                with self.lock:
-                    if stopped.is_set():
-                        return
-                    self.live = rendered
-                self.app.invalidate()
-                frame += 1
-                stopped.wait(.12)
-
-        self.activity_thread = threading.Thread(target=animate, daemon=True)
-        self.activity_thread.start()
-
-    def _stop_activity(self) -> None:
-        if self.activity_stop is not None:
-            self.activity_stop.set()
-            self.activity_stop = None
-        thread, self.activity_thread = self.activity_thread, None
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(.2)
-        with self.lock:
-            self.live = ""
-        self.app.invalidate()
-
-    def _submit(self) -> None:
-        text = self.composer.text.strip()
-        if not text:
-            return
-        self.composer.buffer.set_document(Document("", 0), bypass_readonly=True)
-        if text == "/exit":
-            self.on_exit()
-            return
-        self.user(text)
-        self.on_submit(text)
-
-    def _transcript(self):
-        with self.lock:
-            return ANSI(self.live)
-
-    def _pending(self):
-        lines = self.pending()
-        if not lines:
-            return []
-        return [("class:pending.label", "queued  "),
-                ("class:pending", "\n        ".join(lines[-3:]))]
-
-    def _status(self):
-        state = self.status()
-        active = state.startswith(("thinking", "running"))
-        hint = ("esc interrupt · enter send" if active else
-                "enter send · ctrl+d exit")
-        return [("class:status", f"  {hint}")]
-
-    def _render(self, renderable) -> str:
-        stream = io.StringIO()
-        width = max(40, shutil.get_terminal_size().columns - 2)
-        Console(file=stream, force_terminal=True, color_system="truecolor",
-                highlight=False, width=width).print(renderable)
-        return stream.getvalue()
-
-    def _append(self, text: str) -> int:
-        def write() -> None:
-            sys.stdout.write(text)
-            sys.stdout.flush()
-
-        if not self.app.is_running or self.app.loop is None:
-            write()
-        elif threading.current_thread() is self.app._loop_thread:
-            run_in_terminal(write)
-        else:
-            done = threading.Event()
-
-            def schedule() -> None:
-                task = run_in_terminal(write)
-                task.add_done_callback(lambda _: done.set())
-
-            self.app.loop.call_soon_threadsafe(schedule)
-            done.wait(2)
-        return 0
-
-    def header(self, cwd: Path, model: str, name: str = NAME) -> None:
-        header = Group(RichText(name, style=f"bold {GOLD}"), RichText.assemble(
-            (str(cwd), "dim"), ("  ·  ", "dim"), (model, "dim"),
-            ("  ·  signed in", "dim")), RichText(""))
-        # Place the initial composer near the bottom. These are real terminal
-        # lines, so subsequent turns naturally replace them and enter native
-        # scrollback instead of making a full-screen spacer jump around.
-        padding = max(
-            0, shutil.get_terminal_size().lines - 9)
-        self._append(self._render(header) + "\n" * padding)
-
-    def user(self, text: str) -> None:
-        rendered = self._render(RichText.assemble(("› ", f"bold {GOLD}"), text))
-        self._append(rendered + "\n")
-
-    def assistant(self, text: str, code: str | None) -> None:
-        if text == self.streamed_response:
-            self.streamed_response = ""
-            return
-        rendered = self._render(response_renderable(text))
-        if rendered.strip():
-            self._append(rendered)
-
-    def result(self, result: Result) -> None:
-        ok = result.returncode == 0
-        style = "dim" if ok else "red"
-        label = f"Exit {result.returncode} · {result.elapsed:.1f}s"
-        width = max(40, shutil.get_terminal_size().columns - 4)
-        output = display_output(result.output, width)
-        body = RichText(output.rstrip() or "(no output)", style="dim")
-        self._append(self._render(Group(RichText(label, style=style), body)) + "\n")
-
-    def stopped(self, message: str = "Stopped") -> None:
-        rendered = self._render(RichText(f"! {message}", style="#ff875f")) + "\n"
-        self._append(rendered)
-
-    def run(self) -> None:
-        self.app.pre_run_callables.append(self.on_start)
-        self.app.run()
-
-    def exit(self) -> None:
-        if self.app.is_running:
-            self.app.exit()
+# ── Process interface ────────────────────────────────────────────────────────
 
 
-def print_event(event: Event) -> None:
-    """Render core events as plain output for headless operation."""
-    if event.type == "delta":
-        print(event.value, end="", flush=True)
-    elif event.type == "response":
-        print(flush=True)
-    elif event.type == "result":
+def encode_event(event: Event) -> dict:
+    """Encode an observable agent event for a controlling process."""
+    if event.type == "response":
+        response, code = event.value
+        return {"type": "response", "text": response, "python": code}
+    if event.type == "result":
         result = event.value
         assert isinstance(result, Result)
-        if result.output:
-            print(result.output, end="" if result.output.endswith("\n") else "\n",
-                  flush=True)
-    elif event.type == "error":
-        print(f"! {event.value}", file=sys.stderr, flush=True)
+        return {"type": "result", "output": result.output,
+                "returncode": result.returncode, "elapsed": result.elapsed}
+    return {"type": event.type, "value": event.value}
 
 
-def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
-        effort: str = "high", feral: bool = False,
-        executor: Callable[[str, threading.Event], Result] | None = None,
-        name: str = NAME, folder: str | Path | None = None,
-        headless: bool = False, socket_path: Path | None = None,
-        sandbox: bool = False) -> None:
-    """Run Eko with a TUI or as a plain process controlled by its session socket."""
-    cwd = cwd.expanduser().resolve()
-    if not cwd.is_dir():
-        raise ValueError(f"not a directory: {cwd}")
-    if sandbox and executor is not None:
-        raise ValueError("sandbox and a custom executor are mutually exclusive")
-    ensure_auth()
-    llm = Claude(cwd, model, effort, feral, name,
-                 "/workspace" if sandbox and folder is None else folder)
-    agent = Eko(cwd, llm, feral, executor=executor, socket_path=socket_path,
-                observer=print_event if headless else None)
-    box = None
-    if sandbox:
-        box = Sandbox(cwd, agent.socket_path)
-        agent.executor = box.execute
-    if headless:
-        print(f"EKO_SESSION={agent.socket_path}", flush=True)
-        agent.start(prompt)
-        try:
-            agent.wait()
-        except KeyboardInterrupt:
-            agent.interrupt()
-            agent.wait()
-        finally:
-            agent.stop()
-            if box is not None:
-                box.close()
-        return
-    ui = UI()
-    ui.header(cwd, model, name)
-    if prompt:
-        ui.user(prompt)
-    ui.connect(agent)
+def decode_event(raw: dict) -> Event:
+    """Decode an event produced by :func:`encode_event`."""
+    kind = raw["type"]
+    if kind == "response":
+        return Event(kind, (raw["text"], raw.get("python")))
+    if kind == "result":
+        return Event(kind, Result(
+            raw["output"], raw["returncode"], raw["elapsed"]))
+    return Event(kind, raw.get("value"))
 
-    def exit_app() -> None:
-        agent.stop()
-        ui.exit()
 
-    ui.on_exit = exit_app
-    ui.on_start = lambda: agent.start(prompt)
+def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
+          feral: bool = False, name: str = NAME,
+          socket_path: Path | None = None) -> None:
+    """Run the agent using JSON-lines stdin, stdout, and model socket."""
+    if os.getpid() == 1:
+        threading.Thread(target=_reap_children, daemon=True).start()
+    write_lock = threading.Lock()
+
+    def write(value: dict) -> None:
+        data = json.dumps(value, separators=(",", ":")) + "\n"
+        with write_lock:
+            sys.stdout.write(data)
+            sys.stdout.flush()
+
+    agent = Eko(
+        cwd, Model(model_socket), feral, socket_path=socket_path,
+        observer=lambda event: write(encode_event(event)), name=name)
+    agent.start(prompt)
+    write({"type": "ready", "session": str(agent.socket_path)})
     try:
-        ui.run()
+        for line in sys.stdin:
+            try:
+                message = json.loads(line)
+                kind = message.get("type")
+                if kind == "input":
+                    agent.send(decode_input(message, TERMINAL, cwd))
+                elif kind == "interrupt":
+                    agent.interrupt()
+                elif kind == "stop":
+                    break
+                else:
+                    raise ValueError("unsupported command")
+            except Exception as error:
+                write({"type": "error", "value": f"Command rejected: {error}"})
     except KeyboardInterrupt:
-        agent.stop()
+        agent.interrupt()
     finally:
         agent.stop()
         agent.wait(5)
-        if box is not None:
-            box.close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("prompt", nargs="?", help="prompt to run; opens an input if omitted")
-    parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="working directory")
-    parser.add_argument("--model", default="claude-opus-5")
-    parser.add_argument("--effort", default="high")
-    parser.add_argument("--name", default=NAME)
-    parser.add_argument("--headless", action="store_true",
-                        help="run without the terminal UI")
-    parser.add_argument("--sandbox", action="store_true",
-                        help="run generated Python in a Bubblewrap sandbox")
-    parser.add_argument("--session-socket", type=Path,
-                        help="path for the JSON-lines session socket")
-    parser.add_argument(
-        "--feral", action="store_true",
-        help="keep acting without a completion state until interrupted")
-    args = parser.parse_args()
+    """Run the agent behind its provider-neutral process interface."""
+    import argparse
 
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("prompt", nargs="?")
+    parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    parser.add_argument("--model-socket", type=Path,
+                        default=os.environ.get("EKO_MODEL"))
+    parser.add_argument("--session-socket", type=Path)
+    parser.add_argument("--name", default=NAME)
+    parser.add_argument("--feral", action="store_true")
+    args = parser.parse_args()
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
         parser.error(f"not a directory: {cwd}")
-    try:
-        run(cwd, args.prompt, model=args.model, effort=args.effort, feral=args.feral,
-            name=args.name, headless=args.headless, socket_path=args.session_socket,
-            sandbox=args.sandbox)
-    except (RuntimeError, ValueError) as error:
-        parser.error(str(error))
+    if args.model_socket is None:
+        parser.error("no model service; set EKO_MODEL")
+    serve(cwd, args.model_socket, prompt=args.prompt, feral=args.feral,
+          name=args.name, socket_path=args.session_socket)
 
 
 if __name__ == "__main__":

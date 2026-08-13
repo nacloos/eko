@@ -19,6 +19,7 @@ from unittest import mock
 from pathlib import Path
 
 import eko
+import host
 from rich.console import Console
 
 
@@ -51,16 +52,22 @@ class FakeModel:
     def __init__(self, replies) -> None:
         self.replies = replies
         self.messages: list[str] = []
-        self.histories: list[tuple[eko.Message, ...]] = []
+        self.system = None
         self.cancelled = threading.Event()
 
-    def complete(self, messages, write):
-        self.histories.append(messages)
-        text = eko._message_text(messages[-1]).split("\n", 1)[-1]
+    def start(self, system):
+        self.system = system
+
+    def send(self, message, write):
+        text = eko.message_text(message).split("\n", 1)[-1]
         self.messages.append(text)
         reply = self.replies(text, self.cancelled)
         write(reply)
         return eko.Message("assistant", (eko.Text(reply),))
+
+    def complete(self, system, message, write):
+        self.start(system)
+        return self.send(message, write)
 
     def interrupt(self):
         self.cancelled.set()
@@ -75,7 +82,7 @@ class CoreTests(unittest.TestCase):
         incoming = eko.Input(
             "process-1", (eko.Text("a" * 12), image, eko.Text("b" * 12)), 7)
 
-        limited = eko._limit_input(incoming, 10)
+        limited = eko.limit_input(incoming, 10)
 
         self.assertEqual(limited.source, "process-1")
         self.assertEqual(limited.returncode, 7)
@@ -87,8 +94,8 @@ class CoreTests(unittest.TestCase):
         ))
 
     def test_inputs_are_limited_independently(self):
-        first = eko._limit_input(eko.Input("terminal", (eko.Text("a" * 12),)), 4)
-        second = eko._limit_input(eko.Input("python", (eko.Text("b" * 12),)), 4)
+        first = eko.limit_input(eko.Input("terminal", (eko.Text("a" * 12),)), 4)
+        second = eko.limit_input(eko.Input("python", (eko.Text("b" * 12),)), 4)
 
         self.assertEqual(first.content[0], eko.Text("aa"))
         self.assertEqual(first.content[-1], eko.Text("aa"))
@@ -96,11 +103,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(second.content[-1], eko.Text("bb"))
 
     def test_model_content_uses_plain_attribution_headers(self):
-        message = eko._user_message((
+        message = eko.user_message((
             eko.Input(eko.TERMINAL, (eko.Text("hello"),)),
             eko.Input(eko.PYTHON, (eko.Text("output"),), 1),
         ))
-        content = eko._claude_content(message)
+        content = host._claude_content(message)
         self.assertEqual(content, [
             {"type": "text", "text": "[terminal]\n"},
             {"type": "text", "text": "hello"},
@@ -109,100 +116,149 @@ class CoreTests(unittest.TestCase):
         ])
 
 
-@unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
-class SandboxTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.workspace = self.root / "workspace"
-        self.workspace.mkdir()
-        self.session = self.root / "session.sock"
-        self.listener = socket.socket(socket.AF_UNIX)
-        self.listener.bind(str(self.session))
-        self.listener.listen()
-        self.sandbox = eko.Sandbox(self.workspace, self.session)
-        self.sandbox.start()
+class ModelSocketTests(unittest.TestCase):
+    def test_model_connection_streams_and_returns_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            endpoint = Path(directory) / "model.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(endpoint))
+            listener.listen()
+            model = FakeModel(lambda text, _cancelled: text.upper())
 
-    def tearDown(self):
-        self.sandbox.close()
-        self.listener.close()
-        self.temporary.cleanup()
+            def serve():
+                connection, _ = listener.accept()
+                host._model_client(
+                    connection, Path.cwd(), "fake", "low")
 
-    def test_background_process_survives_actions_and_dies_with_sandbox(self):
-        result = self.sandbox.execute(r'''
-import subprocess, sys
-subprocess.Popen(
-    [sys.executable, "-c",
-     "import time; time.sleep(.2); open('alive', 'w').write('yes'); "
-     "time.sleep(.5); open('escaped', 'w').write('no')"],
-    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL, start_new_session=True)
-''', threading.Event())
-        self.assertEqual(result.returncode, 0)
-        time.sleep(.3)
-        result = self.sandbox.execute("print(open('alive').read())", threading.Event())
-        self.assertEqual(result.output, "yes\n")
+            with mock.patch.object(host, "Claude", return_value=model):
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                remote = eko.Model(endpoint)
+                remote.start(eko.SYSTEM)
+                streamed = []
+                reply = remote.send(conversation("hello")[0], streamed.append)
+                remote.close()
+                thread.join(2)
+            listener.close()
 
-        self.sandbox.close()
-        time.sleep(.5)
-        self.assertFalse((self.workspace / "escaped").exists())
+        self.assertEqual(reply, eko.Message("assistant", (eko.Text("HELLO"),)))
+        self.assertEqual(streamed, ["HELLO"])
 
-    def test_process_can_create_a_nested_sandbox(self):
-        (self.workspace / "child").mkdir()
-        result = self.sandbox.execute(r'''
-import subprocess
-result = subprocess.run([
-    "/usr/bin/bwrap", "--clearenv", "--unshare-user", "--unshare-pid",
-    "--unshare-ipc", "--unshare-uts", "--unshare-net",
-    "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
-    "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
-    "--bind", "/workspace/child", "/workspace",
-    "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
-    "--chdir", "/workspace", "/usr/bin/python3", "-c",
-    "import os; print(os.getcwd())",
-], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-print(result.returncode)
-print(result.stdout, end="")
-''', threading.Event())
+    def test_message_socket_round_trips_images(self):
+        message = eko.Message("user", (
+            eko.Text("look"), eko.Image("image/png", b"image", "x.png")))
+        self.assertEqual(eko.decode_message(eko.encode_message(message)), message)
 
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.output, "0\n/workspace\n")
+    def test_process_events_round_trip(self):
+        events = (
+            eko.Event("state", "thinking"),
+            eko.Event("response", ("answer", "print(1)")),
+            eko.Event("result", eko.Result("1\n", 0, .1)),
+        )
+        self.assertEqual(
+            tuple(eko.decode_event(eko.encode_event(event)) for event in events),
+            events)
 
-    def test_background_process_can_reach_session_socket(self):
-        result = self.sandbox.execute(r'''
-import subprocess, sys
-code = """import os, socket, time
-time.sleep(.2)
-with socket.socket(socket.AF_UNIX) as connection:
-    connection.connect(os.environ[\"EKO_SESSION\"])
-    connection.sendall(b'{\"type\":\"input\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}\\n')
-"""
-subprocess.Popen(
-    [sys.executable, "-c", code], stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-''', threading.Event())
-        self.assertEqual(result.returncode, 0)
 
-        self.listener.settimeout(2)
-        connection, _ = self.listener.accept()
-        with connection:
-            event = json.loads(connection.makefile().readline())
-        self.assertEqual(event["content"][0]["text"], "done")
+class ProcessInterfaceTests(unittest.TestCase):
+    def test_child_does_not_reuse_inherited_parent_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            endpoint = root / "model.sock"
+            parent_session = root / "parent.sock"
+            parent_session.write_text("parent")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(endpoint))
+            listener.listen()
+            environment = os.environ.copy()
+            environment.update({
+                "EKO_MODEL": str(endpoint),
+                "EKO_SESSION": str(parent_session),
+            })
+            process = subprocess.Popen([
+                sys.executable, str(Path(eko.__file__).resolve()),
+                "--cwd", str(root),
+            ], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+               stderr=subprocess.PIPE, text=True, env=environment)
+            assert process.stdin and process.stdout and process.stderr
+            while True:
+                event = json.loads(process.stdout.readline())
+                if event["type"] == "ready":
+                    break
+            self.assertNotEqual(event["session"], str(parent_session))
+            self.assertEqual(parent_session.read_text(), "parent")
+            process.stdin.write('{"type":"stop"}\n')
+            process.stdin.flush()
+            process.wait(5)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+            listener.close()
 
-    def test_interrupt_kills_only_the_action(self):
-        interrupted = threading.Event()
-        results = []
-        thread = threading.Thread(target=lambda: results.append(
-            self.sandbox.execute("import time; time.sleep(30)", interrupted)))
-        thread.start()
-        time.sleep(.2)
-        interrupted.set()
-        thread.join(2)
+    def test_core_runs_behind_json_stdio_and_a_model_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            endpoint = root / "model.sock"
+            session = root / "session.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(endpoint))
+            listener.listen()
+            requests = []
 
-        self.assertFalse(thread.is_alive())
-        self.assertIn("Interrupted", results[0].output)
-        recovered = self.sandbox.execute("print('ready')", threading.Event())
-        self.assertEqual(recovered.output, "ready\n")
+            def complete():
+                connection, _ = listener.accept()
+                with connection, connection.makefile("rb") as reader:
+                    initial = json.loads(reader.readline())
+                    request = json.loads(reader.readline())
+                    request["system"] = initial["system"]
+                    requests.append(request)
+                    reply = eko.encode_message(eko.Message(
+                        "assistant", (eko.Text("finished<done/>"),)))
+                    for event in (
+                            {"delta": "finished<done/>"},
+                            {"message": reply}):
+                        connection.sendall((json.dumps(event) + "\n").encode())
+
+            thread = threading.Thread(target=complete, daemon=True)
+            thread.start()
+            process = subprocess.Popen([
+                sys.executable, str(Path(eko.__file__).resolve()),
+                "--cwd", str(root), "--model-socket", str(endpoint),
+                "--session-socket", str(session), "--name", "Moa",
+            ], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+               stderr=subprocess.PIPE, text=True)
+            assert process.stdin and process.stdout
+            startup = []
+            while True:
+                startup.append(json.loads(process.stdout.readline()))
+                if startup[-1]["type"] == "ready":
+                    break
+            ready = startup[-1]
+            self.assertEqual(ready, {"type": "ready", "session": str(session)})
+            process.stdin.write(json.dumps({
+                "type": "input",
+                "content": [{"type": "text", "text": "hello"}],
+            }) + "\n")
+            process.stdin.flush()
+            events = []
+            while not any(event["type"] == "response" for event in events):
+                events.append(json.loads(process.stdout.readline()))
+            process.stdin.write('{"type":"stop"}\n')
+            process.stdin.flush()
+            process.wait(5)
+            process.stdin.close()
+            process.stdout.close()
+            assert process.stderr
+            process.stderr.close()
+            listener.close()
+            thread.join(2)
+
+        self.assertEqual(process.returncode, 0)
+        self.assertIn("You are Moa.", requests[0]["system"])
+        self.assertEqual(
+            eko.message_text(eko.decode_message(requests[0]["message"])),
+            "[terminal]\nhello")
+        self.assertTrue(any(event["type"] == "delta" for event in events))
 
 
 class EkoTests(unittest.TestCase):
@@ -231,36 +287,20 @@ class EkoTests(unittest.TestCase):
 
         self.assertEqual([message.role for message in agent.messages],
                          ["user", "assistant"])
-        self.assertEqual(eko._message_text(agent.messages[0]), "[terminal]\nhello")
-        self.assertEqual(eko._message_text(agent.messages[1]), "finished<done/>")
-        self.assertEqual(agent.completer.histories, [(agent.messages[0],)])
+        self.assertEqual(eko.message_text(agent.messages[0]), "[terminal]\nhello")
+        self.assertEqual(eko.message_text(agent.messages[1]), "finished<done/>")
+        self.assertIn("You are Eko.", agent.model.system)
         self.stop(agent)
 
     def test_terminal_input_is_limited_before_the_model(self):
         agent, _ui = self.agent(lambda *_: "<done/>")
         agent.start("a" * (eko.MAX_INPUT_TEXT + 100))
-        wait_until(lambda: len(agent.completer.messages) == 1)
+        wait_until(lambda: len(agent.model.messages) == 1)
 
-        message = agent.completer.messages[0]
+        message = agent.model.messages[0]
         self.assertIn("100 characters omitted", message)
         self.assertLess(len(message), eko.MAX_INPUT_TEXT + 100)
         self.stop(agent)
-
-    def test_session_can_use_a_caller_provided_executor(self):
-        calls = []
-
-        def execute(code, interrupted):
-            calls.append((code, interrupted))
-            return eko.Result("custom\n", 0, .25)
-
-        ui = FakeUI()
-        agent = eko.Eko(Path.cwd(), FakeModel(lambda *_: "<done/>"), executor=execute)
-        result = agent._execute("print('custom')")
-
-        self.assertEqual(result, eko.Result("custom\n", 0, .25))
-        self.assertEqual(calls, [("print('custom')", agent.interrupted)])
-        self.assertEqual(agent.state, "running Python")
-        agent.stop()
 
     def test_interrupt_continues_with_message_typed_while_busy(self):
         def replies(message, cancelled):
@@ -275,7 +315,7 @@ class EkoTests(unittest.TestCase):
         wait_until(lambda: agent.state == "thinking")
         agent.send("after interrupt")
         agent.interrupt()
-        wait_until(lambda: agent.completer.messages == ["slow", "after interrupt"])
+        wait_until(lambda: agent.model.messages == ["slow", "after interrupt"])
         wait_until(lambda: agent.state == "idle")
         self.assertEqual(ui.errors, ["Interrupted"])
         self.stop(agent)
@@ -290,7 +330,7 @@ class EkoTests(unittest.TestCase):
         agent.start("broken")
         wait_until(lambda: ui.errors == ["broken connection"])
         agent.send("next")
-        wait_until(lambda: agent.completer.messages == ["broken", "next"])
+        wait_until(lambda: agent.model.messages == ["broken", "next"])
         assert agent.thread is not None
         self.assertTrue(agent.thread.is_alive())
         self.stop(agent)
@@ -307,7 +347,7 @@ class EkoTests(unittest.TestCase):
         agent.start("run")
         wait_until(lambda: agent.state == "running Python")
         agent.send("typed while running")
-        wait_until(lambda: len(agent.completer.messages) == 2)
+        wait_until(lambda: len(agent.model.messages) == 2)
         wait_until(lambda: agent.state == "idle")
         self.assertEqual(ui.results[0].output, "done\n")
         self.stop(agent)
@@ -323,7 +363,7 @@ class EkoTests(unittest.TestCase):
 
         agent, _ui = self.agent(replies)
         agent.start("start")
-        wait_until(lambda: len(agent.completer.messages) == 2)
+        wait_until(lambda: len(agent.model.messages) == 2)
         self.stop(agent)
 
     def test_attribution_text_inside_executable_python_does_not_warn(self):
@@ -335,7 +375,7 @@ class EkoTests(unittest.TestCase):
 
         agent, _ui = self.agent(replies)
         agent.start("start")
-        wait_until(lambda: len(agent.completer.messages) == 2)
+        wait_until(lambda: len(agent.model.messages) == 2)
         self.stop(agent)
 
     def test_detached_python_can_send_attributed_input(self):
@@ -371,9 +411,9 @@ print("started")
 
         agent, ui = self.agent(replies)
         agent.start("start")
-        wait_until(lambda: callback in agent.completer.messages)
+        wait_until(lambda: callback in agent.model.messages)
         wait_until(lambda: agent.state == "idle")
-        self.assertEqual(agent.completer.messages[-1], callback)
+        self.assertEqual(agent.model.messages[-1], callback)
         self.assertEqual(ui.results[0].output, "started\n")
         self.stop(agent)
 
@@ -397,12 +437,12 @@ print("started")
             client.sendall(payload + b"\n")
         wait_until(lambda: agent.pending() == ["arrived while busy"])
         release.set()
-        wait_until(lambda: agent.completer.messages == ["busy", "arrived while busy"])
+        wait_until(lambda: agent.model.messages == ["busy", "arrived while busy"])
         self.stop(agent)
 
     def test_external_multimodal_input_has_attested_process_provenance(self):
         png = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode()
-        event = eko._parse_input({
+        event = eko.decode_input({
             "type": "input",
             "content": [
                 {"type": "text", "text": "look"},
@@ -418,7 +458,7 @@ print("started")
 
 class RenderingTests(unittest.TestCase):
     def test_python_execution_uses_the_original_running_activity_label(self):
-        ui = eko.UI.__new__(eko.UI)
+        ui = host.UI.__new__(host.UI)
         labels = []
         ui._start_activity = labels.append
         ui._stop_activity = lambda: None
@@ -435,7 +475,7 @@ class RenderingTests(unittest.TestCase):
         return stream.getvalue()
 
     def test_partial_python_fence_renders_inside_panel(self):
-        rendered = self.render(eko.response_renderable(
+        rendered = self.render(host.response_renderable(
             "Looking.\n```python-run\nprint('still streaming')"))
         self.assertIn("Looking.", rendered)
         self.assertIn("python", rendered)
@@ -449,7 +489,7 @@ class RenderingTests(unittest.TestCase):
             _append = lambda self, text: output.append(text)
             _render = lambda self, item: RenderingTests.render(self, item)
 
-        stream = eko.NativeStream(Sink())
+        stream = host.NativeStream(Sink())
         stream.feed("Starting.\n```python-")
         stream.feed("run\nprint(0)\nprint")
         stream.feed("(1)\n```\nDone.")
@@ -469,7 +509,7 @@ class RenderingTests(unittest.TestCase):
             f'print("inside: {ticks}python")\n'
             f"{ticks}\nDone.")
         self.assertEqual(
-            eko._python(response),
+            eko.executable_python(response),
             f'print("inside: {ticks}python")\n')
 
         output = []
@@ -478,7 +518,7 @@ class RenderingTests(unittest.TestCase):
             _append = lambda self, text: output.append(text)
             _render = lambda self, item: RenderingTests.render(self, item)
 
-        stream = eko.NativeStream(Sink())
+        stream = host.NativeStream(Sink())
         for chunk in (response[:12], response[12:25], response[25:]):
             stream.feed(chunk)
         stream.finish()
@@ -494,7 +534,7 @@ class RenderingTests(unittest.TestCase):
             _append = lambda self, text: output.append(text)
             _render = lambda self, item: RenderingTests.render(self, item)
 
-        stream = eko.NativeStream(Sink())
+        stream = host.NativeStream(Sink())
         stream.feed("```python-run\nprint(1)\n`")
         stream.feed("``\nAfter.")
         stream.finish()
@@ -506,10 +546,10 @@ class RenderingTests(unittest.TestCase):
     def test_py_fence_is_displayed_but_not_executed(self):
         response = "Example:\n```py\nprint('display only')\n```\n"
 
-        self.assertIsNone(eko._python(response))
+        self.assertIsNone(eko.executable_python(response))
         stream = io.StringIO()
         Console(file=stream, force_terminal=True, color_system="truecolor",
-                width=80).print(eko.response_renderable(response))
+                width=80).print(host.response_renderable(response))
         rendered = stream.getvalue()
         self.assertIn("display only", rendered)
         self.assertIn(" print('display only')", rendered)
@@ -517,8 +557,8 @@ class RenderingTests(unittest.TestCase):
     def test_plain_python_fence_is_displayed_but_not_executed(self):
         response = "Example:\n```python\nprint('display only')\n```\n"
 
-        self.assertIsNone(eko._python(response))
-        self.assertIn("display only", self.render(eko.response_renderable(response)))
+        self.assertIsNone(eko.executable_python(response))
+        self.assertIn("display only", self.render(host.response_renderable(response)))
 
     def test_stream_has_no_hidden_transport_tags(self):
         output = []
@@ -527,7 +567,7 @@ class RenderingTests(unittest.TestCase):
             _append = lambda self, text: output.append(text)
             _render = lambda self, item: RenderingTests.render(self, item)
 
-        stream = eko.NativeStream(Sink())
+        stream = host.NativeStream(Sink())
         stream.feed("Before.\n<python_res")
         stream.feed("ult>1150 lines\nfabricated listing\n</python_")
         stream.feed("result>\nAfter.")
@@ -550,12 +590,12 @@ class RenderingTests(unittest.TestCase):
                         width=80).print(item)
                 return target.getvalue()
 
-        stream = eko.NativeStream(Sink())
+        stream = host.NativeStream(Sink())
         stream.feed("This is **formatted**.\n\n```python\n")
         stream.feed("def answer():\n    return 42\n```")
         stream.finish()
         rendered = "".join(output)
-        self.assertIsNone(eko._python(stream.text))
+        self.assertIsNone(eko.executable_python(stream.text))
         self.assertNotIn("**formatted**", rendered)
         self.assertIn("formatted", rendered)
         self.assertEqual(rendered.count("def answer"), 1)
@@ -568,26 +608,26 @@ class RenderingTests(unittest.TestCase):
             _append = lambda self, text: None
             _render = lambda self, item: captured.append(item.copy()) or ""
 
-        stream = eko.NativeStream(Sink())
-        stream._code_line(eko.RichText("ordinary_name"))
+        stream = host.NativeStream(Sink())
+        stream._code_line(host.RichText("ordinary_name"))
         row = captured[0]
         self.assertEqual(row.style, "")
         self.assertEqual(row.plain[2:15], "ordinary_name")
-        self.assertTrue(any(span.style == eko.GOLD for span in row.spans))
+        self.assertTrue(any(span.style == host.GOLD for span in row.spans))
 
     def test_display_output_reports_omitted_lines(self):
-        output = eko.display_output("\n".join(f"line {i}" for i in range(50)))
+        output = host.display_output("\n".join(f"line {i}" for i in range(50)))
         self.assertIn("… +46 lines", output)
         self.assertIn("line 0", output)
         self.assertIn("line 49", output)
 
     def test_display_output_clips_lines_to_terminal_width(self):
-        output = eko.display_output("x" * 200, width=40)
+        output = host.display_output("x" * 200, width=40)
         self.assertEqual(len(output), 40)
         self.assertTrue(output.endswith("…"))
 
     def test_response_renderer_has_no_special_result_transport(self):
-        rendered = self.render(eko.response_renderable(
+        rendered = self.render(host.response_renderable(
             "<python_result>secret</python_result>Visible"))
         self.assertEqual(rendered.strip(),
                          "<python_result>secret</python_result>Visible")
@@ -598,22 +638,21 @@ class ModelTests(unittest.TestCase):
         prompt = eko.SYSTEM.format(name="Moa", folder="/workspace", mode="")
         self.assertTrue(prompt.startswith("You are Moa.\nYou are in /workspace.\n"))
         self.assertEqual(eko.NAME, "Eko")
-        model = eko.Claude(
-            Path("/host/private"), "fake", "low", name="Moa", folder="/workspace")
+        model = host.Claude(Path("/host/private"), "fake", "low")
         self.assertEqual(model.cwd, Path("/host/private"))
-        self.assertEqual(model.folder, "/workspace")
 
-    def test_sandbox_hides_host_location_from_model(self):
-        agent = mock.Mock(socket_path=Path("/tmp/session.sock"))
-        with mock.patch.object(eko, "ensure_auth"), \
-             mock.patch.object(eko, "Claude") as claude, \
-             mock.patch.object(eko, "Eko", return_value=agent):
-            eko.run(Path.cwd(), headless=True, sandbox=True)
+    def test_host_launches_the_provider_neutral_core(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = host._agent_command(
+                Path.cwd(), Path(directory), sandbox=False,
+                feral=False, name="Moa")
 
-        self.assertEqual(claude.call_args.args[-1], "/workspace")
+        self.assertEqual(Path(command[1]).resolve(), Path(eko.__file__).resolve())
+        self.assertIn("--model-socket", command)
+        self.assertIn("--session-socket", command)
 
     def test_close_tolerates_concurrent_interrupt_clearing_process(self):
-        model = eko.Claude(Path.cwd(), "fake", "low")
+        model = host.Claude(Path.cwd(), "fake", "low")
         stdout = io.BytesIO()
 
         class Process:
@@ -634,7 +673,7 @@ class ModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "projects" / "project"
             project.mkdir(parents=True)
-            model = eko.Claude(Path.cwd(), "fake", "low")
+            model = host.Claude(Path.cwd(), "fake", "low")
             model.started = True
             agent = project / f"{model.session_id}.jsonl"
             unchanged = '{"type":"user","message":{"content":[{"type":"text","text":""}]}}\n'
@@ -651,7 +690,7 @@ class ModelTests(unittest.TestCase):
             ])
             starts = []
 
-            def start():
+            def start(_system):
                 payload = failed if not starts else recovered
                 starts.append(True)
                 script = ("import sys; sys.stdin.buffer.readline(); "
@@ -663,8 +702,8 @@ class ModelTests(unittest.TestCase):
 
             model._start = start
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": directory}):
-                reply = model.complete(conversation("continue"), lambda _: None)
-                self.assertEqual(eko._message_text(reply), "recovered")
+                reply = model.complete(eko.SYSTEM, conversation("continue")[0], lambda _: None)
+                self.assertEqual(eko.message_text(reply), "recovered")
                 model.close()
 
             lines = agent.read_text().splitlines(keepends=True)
@@ -675,7 +714,7 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(len(starts), 2)
 
     def test_failed_resume_can_recover_same_session(self):
-        model = eko.Claude(Path.cwd(), "fake", "low")
+        model = host.Claude(Path.cwd(), "fake", "low")
         model.started = True
         session_id = model.session_id
         failed = json.dumps({
@@ -689,7 +728,7 @@ class ModelTests(unittest.TestCase):
         ])
         starts = []
 
-        def start():
+        def start(_system):
             payload = failed if not starts else recovered
             starts.append(True)
             script = (
@@ -702,14 +741,14 @@ class ModelTests(unittest.TestCase):
             model.started = True
 
         model._start = start
-        reply = model.complete(conversation("continue"), lambda _: None)
-        self.assertEqual(eko._message_text(reply), "recovered")
+        reply = model.complete(eko.SYSTEM, conversation("continue")[0], lambda _: None)
+        self.assertEqual(eko.message_text(reply), "recovered")
         self.assertEqual(len(starts), 2)
         self.assertEqual(model.session_id, session_id)
         model.close()
 
     def test_failed_resume_retries_without_resetting_session(self):
-        model = eko.Claude(Path.cwd(), "fake", "low")
+        model = host.Claude(Path.cwd(), "fake", "low")
         model.started = True
         session_id = model.session_id
         event = json.dumps({
@@ -722,7 +761,7 @@ class ModelTests(unittest.TestCase):
             "sys.stdout.buffer.flush()")
         starts = []
 
-        def start():
+        def start(_system):
             starts.append(True)
             model.proc = subprocess.Popen(
                 [sys.executable, "-c", script], stdin=subprocess.PIPE,
@@ -730,15 +769,15 @@ class ModelTests(unittest.TestCase):
             model.started = True
 
         model._start = start
-        with mock.patch.object(eko, "CALL_TIMEOUT", .5):
+        with mock.patch.object(host, "CALL_TIMEOUT", .5):
             with self.assertRaisesRegex(RuntimeError, "context was not reset"):
-                model.complete(conversation("orphaned output"), lambda _: None)
+                model.complete(eko.SYSTEM, conversation("orphaned output")[0], lambda _: None)
         self.assertGreaterEqual(len(starts), 2)
         self.assertTrue(model.started)
         self.assertEqual(model.session_id, session_id)
 
     def test_multiple_events_buffered_in_one_write_do_not_stall(self):
-        model = eko.Claude(Path.cwd(), "fake", "low")
+        model = host.Claude(Path.cwd(), "fake", "low")
         events = [
             {"type": "stream_event", "event": {
                 "type": "content_block_delta",
@@ -754,7 +793,7 @@ class ModelTests(unittest.TestCase):
             f"sys.stdout.buffer.write({payload.encode()!r}); "
             "sys.stdout.buffer.flush()")
 
-        def start():
+        def start(_system):
             model.proc = subprocess.Popen(
                 [sys.executable, "-c", script], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
@@ -762,13 +801,13 @@ class ModelTests(unittest.TestCase):
 
         model._start = start
         streamed = []
-        reply = model.complete(conversation("hi"), streamed.append)
-        self.assertEqual(eko._message_text(reply), "hello")
+        reply = model.complete(eko.SYSTEM, conversation("hi")[0], streamed.append)
+        self.assertEqual(eko.message_text(reply), "hello")
         self.assertEqual(streamed, ["hello"])
         model.close()
 
     def test_interrupt_does_not_race_with_stdout_reader(self):
-        model = eko.Claude(Path.cwd(), "fake", "low")
+        model = host.Claude(Path.cwd(), "fake", "low")
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(10)"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -779,7 +818,7 @@ class ModelTests(unittest.TestCase):
 
         def complete():
             try:
-                model.complete(conversation("hello"), lambda text: None)
+                model.complete(eko.SYSTEM, conversation("hello")[0], lambda text: None)
             except BaseException as error:
                 errors.append(error)
 
@@ -926,10 +965,10 @@ class DemoModel(FakeModel):
     def __init__(self):
         super().__init__(self.reply)
 
-    def complete(self, messages, write):
-        text = eko._message_text(messages[-1]).split("\n", 1)[-1]
+    def send(self, message, write):
+        text = eko.message_text(message).split("\n", 1)[-1]
         if text != "long code":
-            return super().complete(messages, write)
+            return super().send(message, write)
         self.messages.append("long code")
         self.cancelled.clear()
         parts = ["Streaming a large block.\n```python-run\n"]
@@ -964,7 +1003,7 @@ class DemoModel(FakeModel):
 
 
 def run_demo() -> None:
-    ui = eko.UI()
+    ui = host.UI()
     ui.header(Path.cwd(), "fake")
     agent = eko.Eko(Path.cwd(), DemoModel())
     ui.connect(agent)
