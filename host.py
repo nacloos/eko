@@ -719,6 +719,8 @@ class AgentProcess:
         self.ready = threading.Event()
         self.session: str | None = None
         self._write_lock = threading.Lock()
+        self._diagnostic_lock = threading.Lock()
+        self._startup_diagnostics: list[str] = []
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._errors = threading.Thread(target=self._read_errors, daemon=True)
         self._reader.start()
@@ -739,15 +741,32 @@ class AgentProcess:
                         self.state = str(event.value)
                     self.observer(event)
         except Exception as error:
-            self.observer(core.Event(
-                "error", f"Agent connection failed: {error}"))
+            message = f"Agent connection failed: {error}"
+            self._record_startup_diagnostic(message)
+            self.observer(core.Event("error", message))
         finally:
             self.ready.set()
 
     def _read_errors(self) -> None:
         assert self.proc.stderr
         for line in self.proc.stderr:
-            self.observer(core.Event("error", line.rstrip()))
+            message = line.rstrip()
+            self._record_startup_diagnostic(message)
+            self.observer(core.Event("error", message))
+
+    def _record_startup_diagnostic(self, message: str) -> None:
+        if self.session is None and message:
+            with self._diagnostic_lock:
+                self._startup_diagnostics.append(message)
+
+    def startup_error(self) -> str:
+        """Return diagnostics emitted before the agent became ready."""
+        if self.proc.poll() is not None:
+            self._reader.join(.2)
+            self._errors.join(.2)
+        with self._diagnostic_lock:
+            details = "\n".join(self._startup_diagnostics).strip()
+        return "agent did not start" + (f":\n{details}" if details else "")
 
     def _send(self, value: dict) -> None:
         assert self.proc.stdin
@@ -1058,7 +1077,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         )
         try:
             if not agent.ready.wait(10) or agent.proc.poll() is not None:
-                raise RuntimeError("agent did not start")
+                raise RuntimeError(agent.startup_error())
             if headless:
                 agent.observer = print_event
                 print(f"EKO_SESSION={runtime / 'session.sock'}", flush=True)

@@ -661,6 +661,26 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_agent_startup_error_includes_child_stderr(self):
+        agent = host.AgentProcess([
+            sys.executable, "-c",
+            "import sys; print('sandbox failed', file=sys.stderr); sys.exit(1)",
+        ])
+        self.assertTrue(agent.ready.wait(2))
+        agent.proc.wait(2)
+        self.assertEqual(agent.startup_error(),
+                         "agent did not start:\nsandbox failed")
+        agent.stop()
+
+    def test_agent_startup_error_includes_protocol_failure(self):
+        agent = host.AgentProcess([
+            sys.executable, "-c", "print('not-json', flush=True)",
+        ])
+        self.assertTrue(agent.ready.wait(2))
+        agent.proc.wait(2)
+        self.assertIn("Agent connection failed", agent.startup_error())
+        agent.stop()
+
     def test_host_accepts_new_and_resumed_primary_sessions(self):
         session_id = "12345678-1234-5678-1234-567812345678"
         for option, expected_resume in (
