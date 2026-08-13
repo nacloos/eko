@@ -788,6 +788,19 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(command[index - 1], "--setenv")
         self.assertEqual(command[index + 1], "/run/eko/world.sock")
 
+    def test_sandbox_executes_resolved_interpreter_not_relocated_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = host._agent_command(
+                Path.cwd(), Path(directory), sandbox=True,
+                feral=False, name="Moa")
+
+        source_index = len(command) - 1 - command[::-1].index("/run/eko.py")
+        self.assertEqual(command[source_index - 1], str(Path(sys.executable).resolve()))
+        self.assertNotIn("/opt/eko/bin/python", command)
+        pythonpath = command.index("PYTHONPATH")
+        self.assertEqual(command[pythonpath - 1], "--setenv")
+        self.assertTrue(command[pythonpath + 1].startswith("/opt/eko/"))
+
     def test_world_relay_forwards_stream_without_interpreting_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

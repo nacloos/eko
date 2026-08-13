@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -1007,7 +1008,20 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
     if bwrap is None:
         raise RuntimeError("--sandbox requires Bubblewrap (bwrap)")
     environment = Path(sys.prefix).resolve()
-    base = Path(sys.executable).resolve().parents[1]
+    interpreter = Path(sys.executable).resolve()
+    base = interpreter.parents[1]
+    package_paths = []
+    for name in ("purelib", "platlib"):
+        path = Path(sysconfig.get_path(name)).resolve()
+        try:
+            relative = path.relative_to(environment)
+        except ValueError as error:
+            raise RuntimeError(
+                f"sandbox package directory is outside the environment: {path}"
+            ) from error
+        mapped = str(Path("/opt/eko") / relative)
+        if mapped not in package_paths:
+            package_paths.append(mapped)
     return [
         bwrap, "--die-with-parent", "--new-session", "--as-pid-1",
         "--clearenv", "--unshare-user", "--unshare-pid", "--unshare-ipc",
@@ -1024,9 +1038,11 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         "--remount-ro", "/", "--setenv", "HOME", "/workspace",
         "--setenv", "TMPDIR", "/tmp", "--setenv", "LANG", "C.UTF-8",
         "--setenv", "PATH", "/opt/eko/bin:/usr/bin:/bin",
+        "--setenv", "PYTHONPATH", os.pathsep.join(package_paths),
+        "--setenv", "VIRTUAL_ENV", "/opt/eko",
         "--setenv", "EKO_MODEL", "/run/eko/model.sock",
         "--setenv", "EKO_WORLD", "/run/eko/world.sock",
-        "--chdir", "/workspace", "/opt/eko/bin/python", "/run/eko.py",
+        "--chdir", "/workspace", str(interpreter), "/run/eko.py",
         *arguments,
     ]
 
