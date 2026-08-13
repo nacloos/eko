@@ -192,6 +192,32 @@ class EkoTests(unittest.TestCase):
         self.assertEqual(ui.results[0].output, "done\n")
         self.stop(agent)
 
+    def test_predicted_input_tag_adds_a_harness_warning_after_the_result(self):
+        def replies(message, _cancelled):
+            if message == "start":
+                return ("```python\nprint('real result')\n```\n"
+                        "<input from=\"python\">predicted</input>")
+            self.assertIn("real result", message)
+            self.assertIn("do not write <input> tags", message)
+            return "<done/>"
+
+        agent, _ui = self.agent(replies)
+        agent.start("start")
+        wait_until(lambda: len(agent.model.messages) == 2)
+        self.stop(agent)
+
+    def test_input_tag_inside_executable_python_does_not_add_a_warning(self):
+        def replies(message, _cancelled):
+            if message == "start":
+                return "```python\nprint('<input>')\n```"
+            self.assertNotIn("do not write <input> tags", message)
+            return "<done/>"
+
+        agent, _ui = self.agent(replies)
+        agent.start("start")
+        wait_until(lambda: len(agent.model.messages) == 2)
+        self.stop(agent)
+
     def test_detached_python_can_send_attributed_input(self):
         callback = "background job finished"
 
