@@ -67,7 +67,9 @@ Background processes can send later text or image inputs through EKO_SESSION, a
 Unix stream socket using one JSON object per line. Send
 {{"type":"input","content":[{{"type":"text","text":"done"}}]}}. Images use either
 a workspace-relative "path", or base64 "data" with "media_type". Send
-{{"type":"interrupt"}} to interrupt current work.{mode}
+{{"type":"interrupt"}} to interrupt current work.
+
+EKO_AGENT points to this agent's own executable.{mode}
 """
 
 NUDGE = "Write a fenced ```python-run block, or <done/> if the prompt is resolved."
@@ -276,6 +278,7 @@ class Eko:
         self._set_state("running Python")
         env = os.environ.copy()
         env["EKO_SESSION"] = str(self.socket_path)
+        env["EKO_AGENT"] = str(Path(__file__).resolve())
         return _run_python(code, self.cwd, self.interrupted, env=env)
 
     def _run(self) -> None:

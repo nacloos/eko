@@ -417,6 +417,21 @@ print("started")
         self.assertEqual(ui.results[0].output, "started\n")
         self.stop(agent)
 
+    def test_python_knows_the_agent_executable(self):
+        expected = str(Path(eko.__file__).resolve())
+
+        def replies(message, _cancelled):
+            if message == "start":
+                return "```python-run\nimport os; print(os.environ['EKO_AGENT'])\n```"
+            self.assertEqual(message, expected)
+            return "<done/>"
+
+        agent, ui = self.agent(replies)
+        agent.start("start")
+        wait_until(lambda: agent.state == "idle")
+        self.assertEqual(ui.results[0].output.strip(), expected)
+        self.stop(agent)
+
     def test_external_input_while_busy_joins_the_next_model_turn(self):
         release = threading.Event()
 
