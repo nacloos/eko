@@ -672,6 +672,37 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(run.call_args.kwargs["world_socket"], Path("/tmp/world.sock"))
 
+    def test_feral_host_defaults_to_an_empty_temporary_workspace(self):
+        observed = {}
+
+        def inspect_workspace(cwd, *_args, **_kwargs):
+            observed["cwd"] = cwd
+            observed["exists"] = cwd.is_dir()
+            observed["contents"] = list(cwd.iterdir())
+
+        with (
+            mock.patch.object(sys, "argv", ["eko", "--feral"]),
+            mock.patch.object(host, "run", side_effect=inspect_workspace),
+        ):
+            host.main()
+
+        self.assertTrue(observed["exists"])
+        self.assertEqual(observed["contents"], [])
+        self.assertFalse(observed["cwd"].exists())
+
+    def test_feral_host_preserves_an_explicit_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with (
+                mock.patch.object(
+                    sys, "argv", ["eko", "--feral", "--cwd", directory]
+                ),
+                mock.patch.object(host, "run") as run,
+            ):
+                host.main()
+
+        self.assertEqual(run.call_args.args[0], workspace)
+
     def test_identity_is_configurable_and_location_is_neutral(self):
         prompt = eko.SYSTEM.format(name="Moa", folder="/workspace", mode="")
         self.assertTrue(prompt.startswith("You are Moa.\nYou are in /workspace.\n"))

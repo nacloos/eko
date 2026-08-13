@@ -1078,22 +1078,36 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prompt", nargs="?")
-    parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--cwd", type=Path,
+        help="workspace (feral mode defaults to a fresh temporary directory)",
+    )
     parser.add_argument("--model", default="claude-opus-5")
     parser.add_argument("--effort", default="high")
     parser.add_argument("--name", default=core.NAME)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--sandbox", action="store_true")
-    parser.add_argument("--feral", action="store_true")
+    parser.add_argument(
+        "--feral", action="store_true",
+        help="start immediately and keep acting autonomously",
+    )
     parser.add_argument(
         "--world-socket", type=Path,
         help="connect the agent to an external world socket",
     )
     args = parser.parse_args()
-    try:
-        run(args.cwd, args.prompt, model=args.model, effort=args.effort,
+
+    def launch(cwd: Path) -> None:
+        run(cwd, args.prompt, model=args.model, effort=args.effort,
             feral=args.feral, name=args.name, headless=args.headless,
             sandbox=args.sandbox, world_socket=args.world_socket)
+
+    try:
+        if args.feral and args.cwd is None:
+            with tempfile.TemporaryDirectory(prefix="eko-workspace-") as directory:
+                launch(Path(directory))
+        else:
+            launch(args.cwd or Path.cwd())
     except (RuntimeError, ValueError) as error:
         parser.error(str(error))
 

@@ -36,11 +36,13 @@ Or give it a working folder and an initial prompt:
 uv run eko.py --cwd ~/projects/my-project "Find and fix a bug"
 ```
 
-Feral mode removes the completion state and keeps Eko acting until you interrupt
-it with Escape:
+Feral mode starts immediately and keeps acting autonomously. When `--cwd` is
+omitted, it runs in a fresh empty workspace that is deleted when Eko exits. Pass
+`--cwd` explicitly when the agent should access a persistent project:
 
 ```bash
-uv run eko.py --feral "Keep improving this project"
+eko --sandbox --feral --world-socket /path/to/world.sock
+eko --sandbox --feral --cwd ~/projects/my-project --world-socket /path/to/world.sock
 ```
 
 Run without the terminal interface with `--headless`. Every session exposes a
