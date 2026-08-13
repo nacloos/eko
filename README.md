@@ -74,12 +74,12 @@ or as base64 data from another workspace or an in-memory computation:
 ```
 
 The harness assigns provenance from the delivery path. Terminal input is
-`terminal`, execution output is `python`, harness guidance is `eko`, and socket
+`terminal`, execution output is `python`, harness guidance is `harness`, and socket
 input is `process-<pid>` using kernel-attested Unix peer credentials. Senders do
-not specify their source. Eko presents each atomic input to the model in an
-escaped envelope such as `<input from="process-1842">…</input>`.
+not specify their source. Each user message contains one or more inputs beginning
+with a header such as `[terminal]`, `[python exit=0]`, or `[process-1842]`.
 
-The socket also accepts `{"type":"interrupt"}` and `{"type":"stop"}` frames.
+The socket also accepts `{"type":"interrupt"}` to interrupt current work.
 
 The script requires Python 3.10 or newer. `uv` installs its Python dependencies
 automatically. It uses the Claude Code CLI in print mode, so `claude` must be
