@@ -703,10 +703,15 @@ class UI:
 class AgentProcess:
     """A local proxy for an eko.py process."""
 
-    def __init__(self, command: list[str]) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        env: dict[str, str] | None = None,
+    ) -> None:
         self.proc = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1)
+            stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
         self.observer: Callable[[core.Event], None] = lambda _event: None
         self.state = "starting"
         self.ready = threading.Event()
@@ -902,6 +907,7 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         "--setenv", "TMPDIR", "/tmp", "--setenv", "LANG", "C.UTF-8",
         "--setenv", "PATH", "/opt/eko/bin:/usr/bin:/bin",
         "--setenv", "EKO_MODEL", "/run/eko/model.sock",
+        "--setenv", "EKO_WORLD", "/run/eko/world.sock",
         "--chdir", "/workspace", "/opt/eko/bin/python", "/run/eko.py",
         *arguments,
     ]
@@ -931,8 +937,14 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         runtime = Path(directory)
         server = ModelServer(runtime / "model.sock", cwd, model, effort)
         server.start()
-        agent = AgentProcess(_agent_command(
-            cwd, runtime, sandbox=sandbox, feral=feral, name=name))
+        environment = os.environ.copy()
+        environment["EKO_WORLD"] = str(runtime / "world.sock")
+        agent = AgentProcess(
+            _agent_command(
+                cwd, runtime, sandbox=sandbox, feral=feral, name=name
+            ),
+            env=environment,
+        )
         try:
             if not agent.ready.wait(10) or agent.proc.poll() is not None:
                 raise RuntimeError("agent did not start")

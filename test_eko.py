@@ -666,6 +666,16 @@ class ModelTests(unittest.TestCase):
         self.assertIn("--model-socket", command)
         self.assertIn("--session-socket", command)
 
+    def test_sandbox_exposes_default_world_socket_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = host._agent_command(
+                Path.cwd(), Path(directory), sandbox=True,
+                feral=False, name="Moa")
+
+        index = command.index("EKO_WORLD")
+        self.assertEqual(command[index - 1], "--setenv")
+        self.assertEqual(command[index + 1], "/run/eko/world.sock")
+
     @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
     def test_sandbox_shutdown_removes_socket_and_detached_descendants(self):
         """Namespace teardown must not leave a live daemon or session socket."""
