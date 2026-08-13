@@ -183,7 +183,7 @@ class EkoTests(unittest.TestCase):
     def test_python_output_precedes_input_received_during_execution(self):
         def replies(message, cancelled):
             if message == "run":
-                return "```python\nimport time\ntime.sleep(.2)\nprint('done')\n```"
+                return "```python-run\nimport time\ntime.sleep(.2)\nprint('done')\n```"
             self.assertTrue(message.startswith("done\n"))
             self.assertTrue(message.endswith("typed while running"))
             return "finished<done/>"
@@ -197,12 +197,38 @@ class EkoTests(unittest.TestCase):
         self.assertEqual(ui.results[0].output, "done\n")
         self.stop(agent)
 
+    def test_predicted_attribution_adds_a_harness_warning(self):
+        def replies(message, _cancelled):
+            if message == "start":
+                return ("```python-run\nprint('actual')\n```\n\n"
+                        "[python exit=0]\npredicted")
+            self.assertIn("actual", message)
+            self.assertIn("do not predict the contents", message)
+            return "<done/>"
+
+        agent, _ui = self.agent(replies)
+        agent.start("start")
+        wait_until(lambda: len(agent.model.messages) == 2)
+        self.stop(agent)
+
+    def test_attribution_text_inside_executable_python_does_not_warn(self):
+        def replies(message, _cancelled):
+            if message == "start":
+                return "```python-run\nprint('[python exit=0]')\n```"
+            self.assertNotIn("do not predict the contents", message)
+            return "<done/>"
+
+        agent, _ui = self.agent(replies)
+        agent.start("start")
+        wait_until(lambda: len(agent.model.messages) == 2)
+        self.stop(agent)
+
     def test_detached_python_can_send_attributed_input(self):
         callback = "background job finished"
 
         def replies(message, cancelled):
             if message == "start":
-                return """```python
+                return """```python-run
 import json, os, socket, subprocess, sys
 code = '''
 import json, os, socket, time
@@ -295,7 +321,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_partial_python_fence_renders_inside_panel(self):
         rendered = self.render(eko.response_renderable(
-            "Looking.\n```python\nprint('still streaming')"))
+            "Looking.\n```python-run\nprint('still streaming')"))
         self.assertIn("Looking.", rendered)
         self.assertIn("python", rendered)
         self.assertIn("print('still streaming')", rendered)
@@ -309,8 +335,8 @@ class RenderingTests(unittest.TestCase):
             _render = lambda self, item: RenderingTests.render(self, item)
 
         stream = eko.NativeStream(Sink())
-        stream.feed("Starting.\n```py")
-        stream.feed("thon\nprint(0)\nprint")
+        stream.feed("Starting.\n```python-")
+        stream.feed("run\nprint(0)\nprint")
         stream.feed("(1)\n```\nDone.")
         stream.finish()
         rendered = "".join(output)
@@ -324,7 +350,7 @@ class RenderingTests(unittest.TestCase):
     def test_backticks_inside_python_do_not_close_fence(self):
         ticks = "`" * 3
         response = (
-            f"{ticks}python\n"
+            f"{ticks}python-run\n"
             f'print("inside: {ticks}python")\n'
             f"{ticks}\nDone.")
         self.assertEqual(
@@ -354,7 +380,7 @@ class RenderingTests(unittest.TestCase):
             _render = lambda self, item: RenderingTests.render(self, item)
 
         stream = eko.NativeStream(Sink())
-        stream.feed("```python\nprint(1)\n`")
+        stream.feed("```python-run\nprint(1)\n`")
         stream.feed("``\nAfter.")
         stream.finish()
         rendered = "".join(output)
@@ -372,6 +398,12 @@ class RenderingTests(unittest.TestCase):
         rendered = stream.getvalue()
         self.assertIn("display only", rendered)
         self.assertIn(" print('display only')", rendered)
+
+    def test_plain_python_fence_is_displayed_but_not_executed(self):
+        response = "Example:\n```python\nprint('display only')\n```\n"
+
+        self.assertIsNone(eko._python(response))
+        self.assertIn("display only", self.render(eko.response_renderable(response)))
 
     def test_stream_has_no_hidden_transport_tags(self):
         output = []
@@ -391,7 +423,7 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("1150 lines", rendered)
         self.assertIn("fabricated listing", rendered)
 
-    def test_native_stream_renders_markdown_and_highlighted_python(self):
+    def test_native_stream_renders_markdown_python_without_executing_it(self):
         output = []
 
         class Sink:
@@ -408,9 +440,9 @@ class RenderingTests(unittest.TestCase):
         stream.feed("def answer():\n    return 42\n```")
         stream.finish()
         rendered = "".join(output)
+        self.assertIsNone(eko._python(stream.text))
         self.assertNotIn("**formatted**", rendered)
         self.assertIn("formatted", rendered)
-        self.assertIn("\x1b[", rendered)
         self.assertEqual(rendered.count("def answer"), 1)
         self.assertEqual(rendered.count("return 42"), 1)
 
@@ -775,7 +807,7 @@ class DemoModel(FakeModel):
             return super().ask(message, write)
         self.messages.append("long code")
         self.cancelled.clear()
-        parts = ["Streaming a large block.\n```python\n"]
+        parts = ["Streaming a large block.\n```python-run\n"]
         write(parts[0])
         for number in range(100):
             if self.cancelled.wait(.02):
@@ -797,10 +829,10 @@ class DemoModel(FakeModel):
         if message == "after interrupt":
             return "Recovered after interrupt.<done/>"
         if message == "run code":
-            return "Checking.\n```python\nprint('VISIBLE_RESULT')\n```"
+            return "Checking.\n```python-run\nprint('VISIBLE_RESULT')\n```"
         if message == "complete long code":
             code = "".join(f"print({number})\n" for number in range(100))
-            return f"Completing a large block.\n```python\n{code}```"
+            return f"Completing a large block.\n```python-run\n{code}```"
         if message.startswith("VISIBLE_RESULT"):
             return "Finished.<done/>"
         return f"Received: {message}<done/>"

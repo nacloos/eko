@@ -74,17 +74,16 @@ NAME = "Eko"
 SYSTEM = """You are {name}.
 You are in {folder}.
 
-Write a fenced ```python block to act. After your response ends, it runs in that
+Write a fenced ```python-run block to act. After your response ends, it runs in that
 folder. Its combined output returns in a [python exit=N] section, where N is the
-process exit status.
+process exit status. Fenced ```python and ```py blocks are displayed but not run.
 
 All incoming information is sent to you as user-role messages. A message may contain
 multiple sections, each beginning with a harness-written provenance header.
 [terminal] is text entered by a terminal user. [python exit=N] is output from your
 executed Python, where N is its exit status. [process-PID] is text or images sent by
 a local process. [harness] is operational guidance. Never predict the contents of
-these sections yourself. Use a fenced ```py block for Python that should only be
-displayed.
+these sections yourself.
 
 Background processes can send later text or image inputs through EKO_SESSION, a
 Unix stream socket using one JSON object per line. Send
@@ -93,8 +92,8 @@ a workspace-relative "path", or base64 "data" with "media_type". Send
 {{"type":"interrupt"}} to interrupt current work.{mode}
 """
 
-NUDGE = "Write a fenced ```python block, or <done/> if the prompt is resolved."
-FERAL_NUDGE = "Write a fenced ```python block."
+NUDGE = "Write a fenced ```python-run block, or <done/> if the prompt is resolved."
+FERAL_NUDGE = "Write a fenced ```python-run block."
 NORMAL_MODE = (" If no action is needed, answer directly. When the prompt is "
                "fully resolved, end with <done/> and no Python block.")
 FERAL_MODE = ("\n\nFeral mode: the user is gone; inputs come from Python or other "
@@ -306,6 +305,11 @@ class Eko:
                     response = self.model.ask(
                         tuple(_limit_input(incoming) for incoming in inputs),
                         lambda text: self._emit(Event("delta", text)))
+                    predicted = any(
+                        kind == "prose" and re.search(
+                            r"(?m)^\[(?:terminal|python(?: exit=-?\d+)?|"
+                            r"process-\d+|harness)\]\s*$", text)
+                        for kind, text, _closed in response_segments(response))
                     code = _python(response)
                     self._emit(Event("response", (response, code)))
 
@@ -325,6 +329,11 @@ class Eko:
                             PYTHON, (Text(output),), result.returncode),)
                     if inputs is not None:
                         inputs += self._drain()
+                        if predicted:
+                            inputs += (Input(HARNESS, (Text(
+                                "Warning: do not predict the contents of attributed "
+                                "sections; wait for them to arrive."
+                            ),)),)
                 except InterruptedError:
                     self._emit(Event("error", "Interrupted"))
                     inputs = None
@@ -441,11 +450,11 @@ def _parse_input(message: dict, source: str, cwd: Path) -> Input:
     return Input(source, tuple(content))
 
 
-OPEN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,})[ \t]*python[ \t]*$")
+OPEN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,})[ \t]*python-run[ \t]*$")
 
 
 def _opening_fence(line: str) -> int:
-    """Return the backtick count for a Python fence on this complete line."""
+    """Return the backtick count for an executable Python fence."""
     match = OPEN_FENCE.fullmatch(line.rstrip("\r\n"))
     return len(match.group(1)) if match else 0
 
