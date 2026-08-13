@@ -109,6 +109,102 @@ class CoreTests(unittest.TestCase):
         ])
 
 
+@unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
+class SandboxTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.session = self.root / "session.sock"
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(str(self.session))
+        self.listener.listen()
+        self.sandbox = eko.Sandbox(self.workspace, self.session)
+        self.sandbox.start()
+
+    def tearDown(self):
+        self.sandbox.close()
+        self.listener.close()
+        self.temporary.cleanup()
+
+    def test_background_process_survives_actions_and_dies_with_sandbox(self):
+        result = self.sandbox.execute(r'''
+import subprocess, sys
+subprocess.Popen(
+    [sys.executable, "-c",
+     "import time; time.sleep(.2); open('alive', 'w').write('yes'); "
+     "time.sleep(.5); open('escaped', 'w').write('no')"],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL, start_new_session=True)
+''', threading.Event())
+        self.assertEqual(result.returncode, 0)
+        time.sleep(.3)
+        result = self.sandbox.execute("print(open('alive').read())", threading.Event())
+        self.assertEqual(result.output, "yes\n")
+
+        self.sandbox.close()
+        time.sleep(.5)
+        self.assertFalse((self.workspace / "escaped").exists())
+
+    def test_process_can_create_a_nested_sandbox(self):
+        (self.workspace / "child").mkdir()
+        result = self.sandbox.execute(r'''
+import subprocess
+result = subprocess.run([
+    "/usr/bin/bwrap", "--clearenv", "--unshare-user", "--unshare-pid",
+    "--unshare-ipc", "--unshare-uts", "--unshare-net",
+    "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
+    "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
+    "--bind", "/workspace/child", "/workspace",
+    "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+    "--chdir", "/workspace", "/usr/bin/python3", "-c",
+    "import os; print(os.getcwd())",
+], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+print(result.returncode)
+print(result.stdout, end="")
+''', threading.Event())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.output, "0\n/workspace\n")
+
+    def test_background_process_can_reach_session_socket(self):
+        result = self.sandbox.execute(r'''
+import subprocess, sys
+code = """import os, socket, time
+time.sleep(.2)
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.connect(os.environ[\"EKO_SESSION\"])
+    connection.sendall(b'{\"type\":\"input\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}\\n')
+"""
+subprocess.Popen(
+    [sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+''', threading.Event())
+        self.assertEqual(result.returncode, 0)
+
+        self.listener.settimeout(2)
+        connection, _ = self.listener.accept()
+        with connection:
+            event = json.loads(connection.makefile().readline())
+        self.assertEqual(event["content"][0]["text"], "done")
+
+    def test_interrupt_kills_only_the_action(self):
+        interrupted = threading.Event()
+        results = []
+        thread = threading.Thread(target=lambda: results.append(
+            self.sandbox.execute("import time; time.sleep(30)", interrupted)))
+        thread.start()
+        time.sleep(.2)
+        interrupted.set()
+        thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIn("Interrupted", results[0].output)
+        recovered = self.sandbox.execute("print('ready')", threading.Event())
+        self.assertEqual(recovered.output, "ready\n")
+
+
 class EkoTests(unittest.TestCase):
     def agent(self, replies):
         ui = FakeUI()

@@ -48,6 +48,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import tokenize
 import uuid
 from dataclasses import dataclass
@@ -573,39 +574,13 @@ def _message_text(message: Message) -> str:
 
 
 def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
-               env: dict[str, str] | None = None,
-               sandbox: bool = False) -> Result:
+               env: dict[str, str] | None = None) -> Result:
     """Run one model-written Python block in the persistent working folder."""
     python = cwd / ".venv/bin/python"
     executable = str(python if python.exists() else Path(sys.executable))
-    command = [executable, "-u", "-c", code]
-    if sandbox:
-        bwrap = shutil.which("bwrap")
-        if bwrap is None:
-            raise RuntimeError("--sandbox requires Bubblewrap (bwrap)")
-        session = Path((env or {})["EKO_SESSION"])
-        sandbox_python = ("/workspace/.venv/bin/python" if python.exists()
-                          else "/usr/bin/python3")
-        command = [
-            bwrap, "--die-with-parent", "--clearenv",
-            "--unshare-user", "--unshare-ipc", "--unshare-uts",
-            "--unshare-cgroup", "--unshare-net",
-            "--ro-bind", "/usr", "/usr",
-            "--symlink", "usr/bin", "/bin",
-            "--symlink", "usr/lib", "/lib",
-            "--symlink", "usr/lib64", "/lib64",
-            "--symlink", "usr/sbin", "/sbin",
-            "--bind", str(cwd), "/workspace",
-            "--dev", "/dev", "--tmpfs", "/tmp",
-            "--dir", "/run", "--ro-bind", str(session), "/run/eko.sock",
-            "--setenv", "HOME", "/workspace", "--setenv", "TMPDIR", "/tmp",
-            "--setenv", "PATH", "/usr/bin:/bin",
-            "--setenv", "EKO_SESSION", "/run/eko.sock",
-            "--chdir", "/workspace", sandbox_python, "-u", "-c", code,
-        ]
     started = time.monotonic()
     proc = subprocess.Popen(
-        command, cwd=cwd, stdin=subprocess.DEVNULL,
+        [executable, "-u", "-c", code], cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         errors="replace", start_new_session=True, env=env)
     deadline = started + TIMEOUT
@@ -622,6 +597,172 @@ def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
                 output += f"\n{reason}"
                 break
     return Result(output, proc.returncode, time.monotonic() - started)
+
+
+SANDBOX_INIT = r'''import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+os.unlink("/run/worker.py")
+
+def drain(stream, chunks):
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            return
+        chunks.append(chunk)
+
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+        if request.get("op") != "python":
+            raise ValueError("expected Python")
+        started = time.monotonic()
+        process = subprocess.Popen(
+            [request["python"], "-u", "-c", request["code"]], cwd="/workspace",
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, start_new_session=True)
+        chunks = []
+        reader = threading.Thread(
+            target=drain, args=(process.stdout, chunks), daemon=True)
+        reader.start()
+        timeout = float(request["timeout"])
+        deadline = started + timeout
+        cancelled = False
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                cancelled = True
+                break
+            ready, _, _ = select.select([sys.stdin], [], [], min(.1, remaining))
+            if ready:
+                control = json.loads(sys.stdin.readline())
+                if control.get("op") == "interrupt":
+                    cancelled = True
+                    break
+        if cancelled and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        returncode = process.wait()
+        reader.join(timeout=.25)
+        process.stdout.close()
+        text = b"".join(chunks).decode("utf-8", "replace")
+        if cancelled:
+            text += ("\nInterrupted" if time.monotonic() < deadline else
+                     f"\nTIMEOUT after {timeout:g}s")
+        reply = {"output": text, "returncode": returncode,
+                 "elapsed": time.monotonic() - started}
+    except Exception as error:
+        reply = {"output": f"sandbox error: {type(error).__name__}: {error}\n",
+                 "returncode": 1, "elapsed": 0}
+    print(json.dumps(reply, separators=(",", ":")), flush=True)
+'''
+
+
+class Sandbox:
+    """One persistent Linux namespace for all generated Python actions."""
+
+    def __init__(self, workspace: Path, session: Path) -> None:
+        self.workspace = workspace
+        self.session = session
+        self.process: subprocess.Popen[str] | None = None
+
+    def start(self) -> None:
+        if self.process is not None:
+            return
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            raise RuntimeError("--sandbox requires Bubblewrap (bwrap)")
+        with tempfile.TemporaryFile() as source:
+            source.write(SANDBOX_INIT.encode())
+            source.seek(0)
+            fd = source.fileno()
+            command = [
+                bwrap, "--die-with-parent", "--new-session", "--clearenv",
+                "--unshare-user", "--unshare-pid", "--unshare-ipc",
+                "--unshare-uts", "--unshare-cgroup", "--unshare-net",
+                "--ro-bind", "/usr", "/usr",
+                "--symlink", "usr/bin", "/bin",
+                "--symlink", "usr/lib", "/lib",
+                "--symlink", "usr/lib64", "/lib64",
+                "--symlink", "usr/sbin", "/sbin",
+                "--dir", "/etc",
+                "--ro-bind", "/etc/alternatives", "/etc/alternatives",
+                "--bind", str(self.workspace), "/workspace",
+                "--ro-bind", str(self.session), "/eko.sock",
+                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                "--dir", "/run", "--remount-ro", "/", "--tmpfs", "/run",
+                "--file", str(fd), "/run/worker.py",
+                "--setenv", "HOME", "/workspace",
+                "--setenv", "TMPDIR", "/tmp",
+                "--setenv", "LANG", "C.UTF-8",
+                "--setenv", "PATH", "/usr/bin:/bin",
+                "--setenv", "EKO_SESSION", "/eko.sock",
+                "--chdir", "/workspace", "/usr/bin/python3", "-u", "/run/worker.py",
+            ]
+            self.process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1,
+                start_new_session=True, pass_fds=(fd,))
+        assert self.process.stdout is not None
+        ready, _, _ = select.select([self.process.stdout], [], [], 5)
+        line = self.process.stdout.readline() if ready else ""
+        if not line or json.loads(line) != {"ready": True}:
+            detail = (self.process.stderr.read().strip()
+                      if self.process.poll() is not None else "no response")
+            self.close()
+            raise RuntimeError(f"sandbox failed to start: {detail}")
+
+    def execute(self, code: str, interrupted: threading.Event) -> Result:
+        self.start()
+        process = self.process
+        assert process is not None and process.stdin and process.stdout
+        python = ("/workspace/.venv/bin/python"
+                  if (self.workspace / ".venv/bin/python").exists()
+                  else "/usr/bin/python3")
+        process.stdin.write(json.dumps({
+            "op": "python", "code": code, "python": python, "timeout": TIMEOUT},
+            separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        sent = False
+        while process.poll() is None:
+            ready, _, _ = select.select([process.stdout], [], [], .1)
+            if ready:
+                reply = json.loads(process.stdout.readline())
+                return Result(reply["output"], reply["returncode"], reply["elapsed"])
+            if interrupted.is_set() and not sent:
+                process.stdin.write('{"op":"interrupt"}\n')
+                process.stdin.flush()
+                sent = True
+        assert process.stderr is not None
+        raise RuntimeError("sandbox stopped: " + process.stderr.read().strip())
+
+    def close(self) -> None:
+        process, self.process = self.process, None
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 # ── Claude model connection ───────────────────────────────────────────────────
@@ -1320,11 +1461,10 @@ def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
                  "/workspace" if sandbox and folder is None else folder)
     agent = Eko(cwd, llm, feral, executor=executor, socket_path=socket_path,
                 observer=print_event if headless else None)
+    box = None
     if sandbox:
-        env = os.environ.copy()
-        env["EKO_SESSION"] = str(agent.socket_path)
-        agent.executor = lambda code, interrupted: _run_python(
-            code, cwd, interrupted, env=env, sandbox=True)
+        box = Sandbox(cwd, agent.socket_path)
+        agent.executor = box.execute
     if headless:
         print(f"EKO_SESSION={agent.socket_path}", flush=True)
         agent.start(prompt)
@@ -1335,6 +1475,8 @@ def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
             agent.wait()
         finally:
             agent.stop()
+            if box is not None:
+                box.close()
         return
     ui = UI()
     ui.header(cwd, model, name)
@@ -1354,7 +1496,9 @@ def run(cwd: Path, prompt: str | None = None, *, model: str = "claude-opus-5",
         agent.stop()
     finally:
         agent.stop()
-    agent.wait(5)
+        agent.wait(5)
+        if box is not None:
+            box.close()
 
 
 def main() -> None:
