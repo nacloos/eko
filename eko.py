@@ -153,15 +153,24 @@ class Input:
     returncode: int | None = None
 
 
+@dataclass(frozen=True)
+class Message:
+    """One provider-neutral conversation message."""
+
+    role: str
+    content: tuple[Content, ...]
+
+
 TERMINAL = "terminal"
 PYTHON = "python"
 HARNESS = "harness"
 
 
-class Model(Protocol):
-    """The model capability Eko needs, independent of any provider."""
+class Completer(Protocol):
+    """A stateless message completion capability."""
 
-    def ask(self, inputs: tuple[Input, ...], on_text: Callable[[str], None]) -> str: ...
+    def complete(self, messages: tuple[Message, ...],
+                 on_text: Callable[[str], None]) -> Message: ...
     def interrupt(self) -> None: ...
     def close(self) -> None: ...
 
@@ -175,7 +184,7 @@ class Eko:
     this agent without access to its model credentials or internal state.
     """
 
-    def __init__(self, cwd: Path, model: Model, feral: bool = False,
+    def __init__(self, cwd: Path, completer: Completer, feral: bool = False,
                  executor: Callable[[str, threading.Event], Result] | None = None,
                  socket_path: Path | None = None,
                  observer: Callable[[Event], None] | None = None) -> None:
@@ -183,7 +192,8 @@ class Eko:
         self.feral = feral
         self.executor = executor
         self.observer = observer or (lambda _event: None)
-        self.model = model
+        self.completer = completer
+        self.messages: list[Message] = []
         self.inbox: queue.Queue[Input | None] = queue.Queue()
         self.stopping = threading.Event()
         self.interrupted = threading.Event()
@@ -224,7 +234,7 @@ class Eko:
             return
         self.interrupted.set()
         if self.state == "thinking":
-            self.model.interrupt()
+            self.completer.interrupt()
 
     def stop(self) -> None:
         """Stop accepting work and release the model, listener, and socket path."""
@@ -233,7 +243,7 @@ class Eko:
         self.stopping.set()
         self.interrupted.set()
         self.inbox.put(None)
-        self.model.interrupt()
+        self.completer.interrupt()
         if self.listener is not None:
             self.listener.close()
         self.socket_path.unlink(missing_ok=True)
@@ -303,9 +313,15 @@ class Eko:
                         return
                 try:
                     self._set_state("thinking")
-                    response = self.model.ask(
-                        tuple(_limit_input(incoming) for incoming in inputs),
+                    message = _user_message(tuple(
+                        _limit_input(incoming) for incoming in inputs))
+                    reply = self.completer.complete(
+                        (*self.messages, message),
                         lambda text: self._emit(Event("delta", text)))
+                    if reply.role != "assistant":
+                        raise ValueError("completer must return an assistant message")
+                    response = _message_text(reply)
+                    self.messages.extend((message, reply))
                     predicted = any(
                         kind == "prose" and re.search(
                             r"(?m)^\[(?:terminal|python(?: exit=-?\d+)?|"
@@ -344,7 +360,7 @@ class Eko:
                     self._emit(Event("error", str(error)))
                     inputs = None
         finally:
-            self.model.close()
+            self.completer.close()
 
     # External processes use the same inbox through a small JSON-lines socket.
     def _listen(self) -> None:
@@ -538,6 +554,24 @@ def _limit_input(incoming: Input, limit: int = MAX_INPUT_TEXT) -> Input:
     return Input(incoming.source, tuple(content), incoming.returncode)
 
 
+def _user_message(inputs: tuple[Input, ...]) -> Message:
+    """Combine attributed inputs into one provider-neutral user message."""
+    content: list[Content] = []
+    for index, incoming in enumerate(inputs):
+        header = incoming.source
+        if incoming.returncode is not None:
+            header += f" exit={incoming.returncode}"
+        prefix = "" if index == 0 else "\n\n"
+        content.append(Text(f"{prefix}[{header}]\n"))
+        content.extend(incoming.content)
+    return Message("user", tuple(content))
+
+
+def _message_text(message: Message) -> str:
+    """Return the text of a message in content order."""
+    return "".join(part.text for part in message.content if isinstance(part, Text))
+
+
 def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
                env: dict[str, str] | None = None,
                sandbox: bool = False) -> Result:
@@ -595,25 +629,19 @@ def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
 CALL_TIMEOUT = 300
 
 
-def _claude_content(events: tuple[Input, ...]) -> list[dict]:
-    """Serialize attributed inputs as Claude text and image blocks."""
+def _claude_content(message: Message) -> list[dict]:
+    """Serialize provider-neutral content as Claude blocks."""
     blocks: list[dict] = []
-    for index, event in enumerate(events):
-        header = event.source
-        if event.returncode is not None:
-            header += f" exit={event.returncode}"
-        prefix = "" if index == 0 else "\n\n"
-        blocks.append({"type": "text", "text": f"{prefix}[{header}]\n"})
-        for part in event.content:
-            if isinstance(part, Text):
-                blocks.append({"type": "text", "text": part.text})
-            else:
-                if part.name:
-                    blocks.append({"type": "text", "text": f"Image: {part.name}"})
-                blocks.append({"type": "image", "source": {
-                    "type": "base64", "media_type": part.media_type,
-                    "data": base64.b64encode(part.data).decode(),
-                }})
+    for part in message.content:
+        if isinstance(part, Text):
+            blocks.append({"type": "text", "text": part.text})
+        else:
+            if part.name:
+                blocks.append({"type": "text", "text": f"Image: {part.name}"})
+            blocks.append({"type": "image", "source": {
+                "type": "base64", "media_type": part.media_type,
+                "data": base64.b64encode(part.data).decode(),
+            }})
     return blocks
 
 
@@ -708,9 +736,12 @@ class Claude:
                 self.proc.wait()
         self.proc = None
 
-    def ask(self, events: tuple[Input, ...], on_text: Callable[[str], None],
-            deadline: float | None = None, retry_delay: float = .2) -> str:
-        """Send one message, forwarding text deltas while collecting the response."""
+    def complete(self, messages: tuple[Message, ...], on_text: Callable[[str], None],
+                 deadline: float | None = None,
+                 retry_delay: float = .2) -> Message:
+        """Complete a history using the CLI's internally persisted conversation."""
+        if not messages or messages[-1].role != "user":
+            raise ValueError("conversation must end with a user message")
         self.interrupted.clear()
         deadline = deadline or time.monotonic() + CALL_TIMEOUT
         resuming = self.started
@@ -719,7 +750,7 @@ class Claude:
         proc = self.proc
         assert proc is not None and proc.stdin and proc.stdout
         event = {"type": "user", "message": {
-            "role": "user", "content": _claude_content(events)}}
+            "role": "user", "content": _claude_content(messages[-1])}}
         proc.stdin.write((json.dumps(event) + "\n").encode())
         proc.stdin.flush()
 
@@ -759,21 +790,23 @@ class Claude:
                         proc.stdout.close()
                         if ("text content blocks must be non-empty" in str(detail)
                                 and self._repair_session()):
-                            return self.ask(events, on_text, deadline, retry_delay)
+                            return self.complete(
+                                messages, on_text, deadline, retry_delay)
                         remaining = deadline - time.monotonic()
                         if remaining > 0 and not parts and not complete:
                             delay = min(retry_delay, remaining)
                             if self.interrupted.wait(delay):
                                 raise InterruptedError
                             if time.monotonic() < deadline:
-                                return self.ask(
-                                    events, on_text, deadline,
+                                return self.complete(
+                                    messages, on_text, deadline,
                                     min(retry_delay * 2, 5))
                         raise RuntimeError(
                             "Model session could not resume; context was not "
                             f"reset. {detail or ''}".rstrip())
                     raise RuntimeError(detail or "Model call failed")
-                return complete or "".join(parts)
+                return Message(
+                    "assistant", (Text(complete or "".join(parts)),))
         raise RuntimeError("Model produced no result")
 
     def close(self) -> None:

@@ -36,6 +36,10 @@ def event_text(events) -> str:
                          if isinstance(part, eko.Text))
 
 
+def conversation(text: str) -> tuple[eko.Message, ...]:
+    return (eko.Message("user", (eko.Text(text),)),)
+
+
 class FakeUI:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -47,14 +51,16 @@ class FakeModel:
     def __init__(self, replies) -> None:
         self.replies = replies
         self.messages: list[str] = []
+        self.histories: list[tuple[eko.Message, ...]] = []
         self.cancelled = threading.Event()
 
-    def ask(self, message, write):
-        text = event_text(message)
+    def complete(self, messages, write):
+        self.histories.append(messages)
+        text = eko._message_text(messages[-1]).split("\n", 1)[-1]
         self.messages.append(text)
         reply = self.replies(text, self.cancelled)
         write(reply)
-        return reply
+        return eko.Message("assistant", (eko.Text(reply),))
 
     def interrupt(self):
         self.cancelled.set()
@@ -90,10 +96,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(second.content[-1], eko.Text("bb"))
 
     def test_model_content_uses_plain_attribution_headers(self):
-        content = eko._claude_content((
+        message = eko._user_message((
             eko.Input(eko.TERMINAL, (eko.Text("hello"),)),
             eko.Input(eko.PYTHON, (eko.Text("output"),), 1),
         ))
+        content = eko._claude_content(message)
         self.assertEqual(content, [
             {"type": "text", "text": "[terminal]\n"},
             {"type": "text", "text": "hello"},
@@ -121,12 +128,24 @@ class EkoTests(unittest.TestCase):
         assert agent.thread is not None
         self.assertFalse(agent.thread.is_alive())
 
+    def test_agent_owns_provider_neutral_conversation(self):
+        agent, _ui = self.agent(lambda *_: "finished<done/>")
+        agent.start("hello")
+        wait_until(lambda: len(agent.messages) == 2)
+
+        self.assertEqual([message.role for message in agent.messages],
+                         ["user", "assistant"])
+        self.assertEqual(eko._message_text(agent.messages[0]), "[terminal]\nhello")
+        self.assertEqual(eko._message_text(agent.messages[1]), "finished<done/>")
+        self.assertEqual(agent.completer.histories, [(agent.messages[0],)])
+        self.stop(agent)
+
     def test_terminal_input_is_limited_before_the_model(self):
         agent, _ui = self.agent(lambda *_: "<done/>")
         agent.start("a" * (eko.MAX_INPUT_TEXT + 100))
-        wait_until(lambda: len(agent.model.messages) == 1)
+        wait_until(lambda: len(agent.completer.messages) == 1)
 
-        message = agent.model.messages[0]
+        message = agent.completer.messages[0]
         self.assertIn("100 characters omitted", message)
         self.assertLess(len(message), eko.MAX_INPUT_TEXT + 100)
         self.stop(agent)
@@ -160,7 +179,7 @@ class EkoTests(unittest.TestCase):
         wait_until(lambda: agent.state == "thinking")
         agent.send("after interrupt")
         agent.interrupt()
-        wait_until(lambda: agent.model.messages == ["slow", "after interrupt"])
+        wait_until(lambda: agent.completer.messages == ["slow", "after interrupt"])
         wait_until(lambda: agent.state == "idle")
         self.assertEqual(ui.errors, ["Interrupted"])
         self.stop(agent)
@@ -175,7 +194,7 @@ class EkoTests(unittest.TestCase):
         agent.start("broken")
         wait_until(lambda: ui.errors == ["broken connection"])
         agent.send("next")
-        wait_until(lambda: agent.model.messages == ["broken", "next"])
+        wait_until(lambda: agent.completer.messages == ["broken", "next"])
         assert agent.thread is not None
         self.assertTrue(agent.thread.is_alive())
         self.stop(agent)
@@ -192,7 +211,7 @@ class EkoTests(unittest.TestCase):
         agent.start("run")
         wait_until(lambda: agent.state == "running Python")
         agent.send("typed while running")
-        wait_until(lambda: len(agent.model.messages) == 2)
+        wait_until(lambda: len(agent.completer.messages) == 2)
         wait_until(lambda: agent.state == "idle")
         self.assertEqual(ui.results[0].output, "done\n")
         self.stop(agent)
@@ -208,7 +227,7 @@ class EkoTests(unittest.TestCase):
 
         agent, _ui = self.agent(replies)
         agent.start("start")
-        wait_until(lambda: len(agent.model.messages) == 2)
+        wait_until(lambda: len(agent.completer.messages) == 2)
         self.stop(agent)
 
     def test_attribution_text_inside_executable_python_does_not_warn(self):
@@ -220,7 +239,7 @@ class EkoTests(unittest.TestCase):
 
         agent, _ui = self.agent(replies)
         agent.start("start")
-        wait_until(lambda: len(agent.model.messages) == 2)
+        wait_until(lambda: len(agent.completer.messages) == 2)
         self.stop(agent)
 
     def test_detached_python_can_send_attributed_input(self):
@@ -256,9 +275,9 @@ print("started")
 
         agent, ui = self.agent(replies)
         agent.start("start")
-        wait_until(lambda: callback in agent.model.messages)
+        wait_until(lambda: callback in agent.completer.messages)
         wait_until(lambda: agent.state == "idle")
-        self.assertEqual(agent.model.messages[-1], callback)
+        self.assertEqual(agent.completer.messages[-1], callback)
         self.assertEqual(ui.results[0].output, "started\n")
         self.stop(agent)
 
@@ -282,7 +301,7 @@ print("started")
             client.sendall(payload + b"\n")
         wait_until(lambda: agent.pending() == ["arrived while busy"])
         release.set()
-        wait_until(lambda: agent.model.messages == ["busy", "arrived while busy"])
+        wait_until(lambda: agent.completer.messages == ["busy", "arrived while busy"])
         self.stop(agent)
 
     def test_external_multimodal_input_has_attested_process_provenance(self):
@@ -548,8 +567,8 @@ class ModelTests(unittest.TestCase):
 
             model._start = start
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": directory}):
-                self.assertEqual(model.ask((eko.Input(eko.TERMINAL, (eko.Text("continue"),)),),
-                                           lambda _: None), "recovered")
+                reply = model.complete(conversation("continue"), lambda _: None)
+                self.assertEqual(eko._message_text(reply), "recovered")
                 model.close()
 
             lines = agent.read_text().splitlines(keepends=True)
@@ -587,8 +606,8 @@ class ModelTests(unittest.TestCase):
             model.started = True
 
         model._start = start
-        self.assertEqual(model.ask((eko.Input(eko.TERMINAL, (eko.Text("continue"),)),),
-                                   lambda _: None), "recovered")
+        reply = model.complete(conversation("continue"), lambda _: None)
+        self.assertEqual(eko._message_text(reply), "recovered")
         self.assertEqual(len(starts), 2)
         self.assertEqual(model.session_id, session_id)
         model.close()
@@ -617,8 +636,7 @@ class ModelTests(unittest.TestCase):
         model._start = start
         with mock.patch.object(eko, "CALL_TIMEOUT", .5):
             with self.assertRaisesRegex(RuntimeError, "context was not reset"):
-                model.ask((eko.Input(eko.TERMINAL, (eko.Text(
-                    "orphaned output"),)),), lambda _: None)
+                model.complete(conversation("orphaned output"), lambda _: None)
         self.assertGreaterEqual(len(starts), 2)
         self.assertTrue(model.started)
         self.assertEqual(model.session_id, session_id)
@@ -648,7 +666,8 @@ class ModelTests(unittest.TestCase):
 
         model._start = start
         streamed = []
-        self.assertEqual(model.ask((eko.Input(eko.TERMINAL, (eko.Text("hi"),)),), streamed.append), "hello")
+        reply = model.complete(conversation("hi"), streamed.append)
+        self.assertEqual(eko._message_text(reply), "hello")
         self.assertEqual(streamed, ["hello"])
         model.close()
 
@@ -662,13 +681,13 @@ class ModelTests(unittest.TestCase):
         model.started = True
         errors = []
 
-        def ask():
+        def complete():
             try:
-                model.ask((eko.Input(eko.TERMINAL, (eko.Text("hello"),)),), lambda text: None)
+                model.complete(conversation("hello"), lambda text: None)
             except BaseException as error:
                 errors.append(error)
 
-        thread = threading.Thread(target=ask)
+        thread = threading.Thread(target=complete)
         thread.start()
         time.sleep(.05)
         model.interrupt()
@@ -811,9 +830,10 @@ class DemoModel(FakeModel):
     def __init__(self):
         super().__init__(self.reply)
 
-    def ask(self, message, write):
-        if event_text(message) != "long code":
-            return super().ask(message, write)
+    def complete(self, messages, write):
+        text = eko._message_text(messages[-1]).split("\n", 1)[-1]
+        if text != "long code":
+            return super().complete(messages, write)
         self.messages.append("long code")
         self.cancelled.clear()
         parts = ["Streaming a large block.\n```python-run\n"]
@@ -826,7 +846,7 @@ class DemoModel(FakeModel):
             write(part)
         parts.append("```")
         write(parts[-1])
-        return "".join(parts)
+        return eko.Message("assistant", (eko.Text("".join(parts)),))
 
     def reply(self, message, cancelled):
         cancelled.clear()
