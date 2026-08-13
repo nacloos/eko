@@ -661,6 +661,17 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_host_accepts_an_explicit_world_socket(self):
+        with (
+            mock.patch.object(
+                sys, "argv", ["eko", "--world-socket", "/tmp/world.sock"]
+            ),
+            mock.patch.object(host, "run") as run,
+        ):
+            host.main()
+
+        self.assertEqual(run.call_args.kwargs["world_socket"], Path("/tmp/world.sock"))
+
     def test_identity_is_configurable_and_location_is_neutral(self):
         prompt = eko.SYSTEM.format(name="Moa", folder="/workspace", mode="")
         self.assertTrue(prompt.startswith("You are Moa.\nYou are in /workspace.\n"))

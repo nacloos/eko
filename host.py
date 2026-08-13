@@ -1017,12 +1017,13 @@ def print_event(event: core.Event) -> None:
 
 
 def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
-        feral: bool, name: str, headless: bool, sandbox: bool) -> None:
+        feral: bool, name: str, headless: bool, sandbox: bool,
+        world_socket: Path | None = None) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
     ensure_auth()
-    upstream_world = os.environ.get("EKO_WORLD")
+    upstream_world = world_socket or os.environ.get("EKO_WORLD")
     with tempfile.TemporaryDirectory(prefix="eko-") as directory:
         runtime = Path(directory)
         server = ModelServer(runtime / "model.sock", cwd, model, effort)
@@ -1084,11 +1085,15 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--sandbox", action="store_true")
     parser.add_argument("--feral", action="store_true")
+    parser.add_argument(
+        "--world-socket", type=Path,
+        help="connect the agent to an external world socket",
+    )
     args = parser.parse_args()
     try:
         run(args.cwd, args.prompt, model=args.model, effort=args.effort,
             feral=args.feral, name=args.name, headless=args.headless,
-            sandbox=args.sandbox)
+            sandbox=args.sandbox, world_socket=args.world_socket)
     except (RuntimeError, ValueError) as error:
         parser.error(str(error))
 
