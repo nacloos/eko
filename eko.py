@@ -69,7 +69,8 @@ Unix stream socket using one JSON object per line. Send
 a workspace-relative "path", or base64 "data" with "media_type". Send
 {{"type":"interrupt"}} to interrupt current work.
 
-EKO_AGENT points to this agent's own executable.{mode}
+EKO_AGENT points to this agent's own executable. EKO_WORLD, when available, is
+an OpenRPC Unix socket.{mode}
 """
 
 NUDGE = "Write a fenced ```python-run block, or <done/> if the prompt is resolved."

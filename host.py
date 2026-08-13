@@ -866,6 +866,95 @@ class ModelServer:
             thread.join(2)
 
 
+class WorldRelay:
+    """Expose one upstream Unix stream socket at an agent-local path."""
+
+    def __init__(self, path: Path, upstream: Path) -> None:
+        self.path = path.resolve()
+        self.upstream = upstream.expanduser().resolve()
+        if self.path == self.upstream:
+            raise ValueError("world relay endpoints must be different")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.unlink(missing_ok=True)
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        self.path.chmod(0o600)
+        self.listener.listen()
+        self.listener.settimeout(.2)
+        self.stopping = threading.Event()
+        self.connections: set[socket.socket] = set()
+        self.connection_lock = threading.Lock()
+        self.clients: list[threading.Thread] = []
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stopping.is_set():
+            try:
+                downstream, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            thread = threading.Thread(
+                target=self._bridge, args=(downstream,), daemon=True
+            )
+            self.clients.append(thread)
+            thread.start()
+
+    def _bridge(self, downstream: socket.socket) -> None:
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sockets = (downstream, upstream)
+        with self.connection_lock:
+            self.connections.update(sockets)
+        try:
+            upstream.connect(str(self.upstream))
+            threads = [
+                threading.Thread(
+                    target=self._pump, args=(source, destination), daemon=True
+                )
+                for source, destination in ((downstream, upstream), (upstream, downstream))
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        except OSError:
+            pass
+        finally:
+            with self.connection_lock:
+                self.connections.difference_update(sockets)
+            for connection in sockets:
+                connection.close()
+
+    @staticmethod
+    def _pump(source: socket.socket, destination: socket.socket) -> None:
+        try:
+            while data := source.recv(64 * 1024):
+                destination.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                destination.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self.stopping.set()
+        self.listener.close()
+        with self.connection_lock:
+            connections = tuple(self.connections)
+        for connection in connections:
+            connection.close()
+        self.thread.join(2)
+        for thread in self.clients:
+            thread.join(2)
+        self.path.unlink(missing_ok=True)
+
+
 def _mount_parents(path: Path) -> list[str]:
     parents = list(path.parents)[:-1]
     return [item for parent in reversed(parents)
@@ -933,10 +1022,18 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
     ensure_auth()
+    upstream_world = os.environ.get("EKO_WORLD")
     with tempfile.TemporaryDirectory(prefix="eko-") as directory:
         runtime = Path(directory)
         server = ModelServer(runtime / "model.sock", cwd, model, effort)
         server.start()
+        relay = (
+            WorldRelay(runtime / "world.sock", Path(upstream_world))
+            if upstream_world
+            else None
+        )
+        if relay is not None:
+            relay.start()
         environment = os.environ.copy()
         environment["EKO_WORLD"] = str(runtime / "world.sock")
         agent = AgentProcess(
@@ -972,6 +1069,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             except KeyboardInterrupt:
                 signal.signal(signal.SIGINT, signal.SIG_IGN)
             agent.stop()
+            if relay is not None:
+                relay.close()
             server.close()
 
 

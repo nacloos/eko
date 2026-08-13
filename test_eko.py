@@ -676,6 +676,36 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(command[index - 1], "--setenv")
         self.assertEqual(command[index + 1], "/run/eko/world.sock")
 
+    def test_world_relay_forwards_stream_without_interpreting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            upstream_path = root / "upstream.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(upstream_path))
+            listener.listen()
+
+            def echo():
+                connection, _ = listener.accept()
+                with connection:
+                    while data := connection.recv(65536):
+                        connection.sendall(data)
+
+            server = threading.Thread(target=echo)
+            server.start()
+            relay = host.WorldRelay(root / "world.sock", upstream_path)
+            relay.start()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(str(root / "world.sock"))
+                    request = b'{"jsonrpc":"2.0","id":1,"method":"rpc.discover"}\n'
+                    client.sendall(request)
+                    self.assertEqual(client.recv(len(request)), request)
+            finally:
+                relay.close()
+                listener.close()
+                server.join(2)
+            self.assertFalse((root / "world.sock").exists())
+
     @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
     def test_sandbox_shutdown_removes_socket_and_detached_descendants(self):
         """Namespace teardown must not leave a live daemon or session socket."""
