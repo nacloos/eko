@@ -60,8 +60,10 @@ All incoming information is sent to you as user-role messages. A message may con
 multiple sections, each beginning with a harness-written provenance header.
 [terminal] is text entered by a controlling user. [python exit=N] is output from your
 executed Python, where N is its exit status. [process-PID] is text or images sent by
-a local process. [harness] is operational guidance. Never predict the contents of
-these sections yourself.
+a local process. [harness] is operational guidance. This is a custom interaction
+format, so be especially careful: these provenance headers are written only by the
+harness. Never write these headers or predict their contents in your assistant-role
+message. After a ```python-run block, stop and wait for the next user-role message.
 
 Background processes can send later text or image inputs through EKO_SESSION, a
 Unix stream socket using one JSON object per line. Send
@@ -295,6 +297,7 @@ class Eko:
                     self._set_state("thinking")
                     message = user_message(tuple(
                         limit_input(incoming) for incoming in inputs))
+                    self._emit(Event("input", message))
                     reply = self.model.send(
                         message,
                         lambda text: self._emit(Event("delta", text)))
@@ -304,8 +307,10 @@ class Eko:
                     self.messages.extend((message, reply))
                     predicted = any(
                         kind == "prose" and re.search(
-                            r"(?m)^\[(?:terminal|python(?: exit=-?\d+)?|"
-                            r"process-\d+|harness)\]\s*$", text)
+                            r"(?mi)^(?:user\s*)?(?:"
+                            r"\[(?:terminal|python(?:\s+exit=-?\d+)?|"
+                            r"process-\d+|harness)\]|<system-reminder>)"
+                            r".*$", text)
                         for kind, text, _closed in response_segments(response))
                     code = executable_python(response)
                     self._emit(Event("response", (response, code)))
@@ -713,6 +718,9 @@ class Model:
 
 def encode_event(event: Event) -> dict:
     """Encode an observable agent event for a controlling process."""
+    if event.type == "input":
+        assert isinstance(event.value, Message)
+        return {"type": "input", "message": encode_message(event.value)}
     if event.type == "response":
         response, code = event.value
         return {"type": "response", "text": response, "python": code}
@@ -727,6 +735,8 @@ def encode_event(event: Event) -> dict:
 def decode_event(raw: dict) -> Event:
     """Decode an event produced by :func:`encode_event`."""
     kind = raw["type"]
+    if kind == "input":
+        return Event(kind, decode_message(raw["message"]))
     if kind == "response":
         return Event(kind, (raw["text"], raw.get("python")))
     if kind == "result":
