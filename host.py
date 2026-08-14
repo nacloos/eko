@@ -86,6 +86,7 @@ class Claude:
         self.proc: subprocess.Popen[bytes] | None = None
         self.started = resume
         self.interrupted = threading.Event()
+        self.context_used = 0
 
     def _repair_session(self) -> bool:
         """Repair this session's empty assistant text blocks."""
@@ -224,6 +225,12 @@ class Claude:
                             "Model session could not resume; context was not "
                             f"reset. {detail or ''}".rstrip())
                     raise RuntimeError(detail or "Model call failed")
+                usage = data.get("usage") or {}
+                self.context_used = (int(usage["prompt_tokens"])
+                                     if usage.get("prompt_tokens") is not None else
+                                     sum(int(usage.get(name) or 0) for name in (
+                                         "input_tokens", "cache_read_input_tokens",
+                                         "cache_creation_input_tokens")))
                 return core.Message(
                     "assistant", (core.Text(complete or "".join(parts)),))
         raise RuntimeError("Model produced no result")
@@ -823,7 +830,8 @@ def _model_client(connection: socket.socket, cwd: Path,
             reply = claude.complete(
                 system, core.decode_message(message),
                 lambda text: send({"delta": text}))
-            send({"message": core.encode_message(reply)})
+            send({"message": core.encode_message(reply),
+                  "context_used": claude.context_used})
         except InterruptedError:
             send({"error": "Interrupted", "interrupted": True})
         except Exception as error:
@@ -992,7 +1000,7 @@ def _mount_parents(path: Path) -> list[str]:
 
 
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
-                   feral: bool, name: str) -> list[str]:
+                   feral: bool, name: str, context: int = 0) -> list[str]:
     source = Path(core.__file__).resolve()
     arguments = ["--cwd", "/workspace" if sandbox else str(cwd),
                  "--model-socket",
@@ -1000,6 +1008,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                  "--session-socket",
                  "/run/eko/session.sock" if sandbox else str(runtime / "session.sock"),
                  "--name", name]
+    if context:
+        arguments.extend(("--context", str(context)))
     if feral:
         arguments.append("--feral")
     if not sandbox:
@@ -1064,7 +1074,7 @@ def print_event(event: core.Event) -> None:
 def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         feral: bool, name: str, headless: bool, sandbox: bool,
         world_socket: Path | None = None, session_id: str | None = None,
-        resume: bool = False) -> None:
+        resume: bool = False, context: int = 0) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -1087,7 +1097,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         environment["EKO_WORLD"] = str(runtime / "world.sock")
         agent = AgentProcess(
             _agent_command(
-                cwd, runtime, sandbox=sandbox, feral=feral, name=name
+                cwd, runtime, sandbox=sandbox, feral=feral, name=name,
+                context=context
             ),
             env=environment,
         )
@@ -1133,6 +1144,7 @@ def main() -> None:
     parser.add_argument("--model", default="claude-opus-5")
     parser.add_argument("--effort", default="high")
     parser.add_argument("--name", default=core.NAME)
+    parser.add_argument("--context", type=int, default=0)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--sandbox", action="store_true")
     parser.add_argument(
@@ -1157,7 +1169,7 @@ def main() -> None:
             feral=args.feral, name=args.name, headless=args.headless,
             sandbox=args.sandbox, world_socket=args.world_socket,
             session_id=args.session_id or args.resume,
-            resume=args.resume is not None)
+            resume=args.resume is not None, context=args.context)
 
     try:
         if args.feral and args.cwd is None:

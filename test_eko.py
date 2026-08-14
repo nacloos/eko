@@ -43,6 +43,7 @@ def conversation(text: str) -> tuple[eko.Message, ...]:
 
 class FakeUI:
     def __init__(self) -> None:
+        self.events: list[eko.Event] = []
         self.messages: list[str] = []
         self.errors: list[str] = []
         self.results: list[eko.Result] = []
@@ -54,6 +55,8 @@ class FakeModel:
         self.messages: list[str] = []
         self.system = None
         self.cancelled = threading.Event()
+        self.context_used = 0
+        self.resets = 0
 
     def start(self, system):
         self.system = system
@@ -72,11 +75,22 @@ class FakeModel:
     def interrupt(self):
         self.cancelled.set()
 
+    def reset(self, system):
+        self.system = system
+        self.context_used = 0
+        self.resets += 1
+
     def close(self):
         pass
 
 
 class CoreTests(unittest.TestCase):
+    def test_context_status_line_is_not_a_provenance_header(self):
+        self.assertEqual(
+            eko.context_status_line(64_000, 128_000),
+            "context 64k/128k (50%)",
+        )
+
     def test_each_input_has_one_text_budget_across_all_of_its_parts(self):
         image = eko.Image("image/png", b"image")
         incoming = eko.Input(
@@ -152,6 +166,8 @@ class ModelSocketTests(unittest.TestCase):
     def test_process_events_round_trip(self):
         events = (
             eko.Event("state", "thinking"),
+            eko.Event("input", eko.Message("user", (
+                eko.Text("[terminal]\n"), eko.Text("hello")))),
             eko.Event("response", ("answer", "print(1)")),
             eko.Event("result", eko.Result("1\n", 0, .1)),
         )
@@ -265,6 +281,7 @@ class EkoTests(unittest.TestCase):
     def agent(self, replies):
         ui = FakeUI()
         def observe(event):
+            ui.events.append(event)
             if event.type == "response":
                 ui.messages.append(event.value[0])
             elif event.type == "result":
@@ -302,6 +319,50 @@ class EkoTests(unittest.TestCase):
         self.assertEqual(
             eko.message_text(agent.messages[0]), "[harness]\nBegin."
         )
+        self.stop(agent)
+
+    def test_context_notices_warn_then_reset_to_opening_input(self):
+        usages = iter((50_000, 90_000, 95_000, 96_000, 0))
+        model = None
+
+        def replies(message, _cancelled):
+            assert model is not None
+            model.context_used = next(usages)
+            if len(model.messages) == 5:
+                return "<done/>"
+            return "```python-run\npass\n```"
+
+        model = FakeModel(replies)
+        agent = eko.Eko(Path.cwd(), model, context=100_000)
+        agent.start("standing task")
+        wait_until(lambda: len(model.messages) == 5)
+        wait_until(lambda: agent.state == "idle")
+
+        self.assertEqual(model.messages[0], "standing task")
+        self.assertIn("[harness]\ncontext 50k/100k (50%)", model.messages[1])
+        self.assertIn("[harness]\ncontext 90k/100k (90%)", model.messages[2])
+        self.assertEqual(model.messages[3], eko.FAREWELL)
+        self.assertEqual(model.messages[4], "standing task")
+        self.assertEqual(model.resets, 1)
+        self.stop(agent)
+
+    def test_context_reset_is_disabled_by_default(self):
+        model = None
+
+        def replies(_message, _cancelled):
+            assert model is not None
+            model.context_used = 100_000
+            return ("```python-run\npass\n```" if len(model.messages) == 1
+                    else "<done/>")
+
+        model = FakeModel(replies)
+        agent = eko.Eko(Path.cwd(), model)
+        agent.start("standing task")
+        wait_until(lambda: agent.state == "idle")
+
+        self.assertEqual(len(model.messages), 2)
+        self.assertNotIn("context ", model.messages[1])
+        self.assertEqual(model.resets, 0)
         self.stop(agent)
 
     def test_terminal_input_is_limited_before_the_model(self):
@@ -376,6 +437,35 @@ class EkoTests(unittest.TestCase):
         agent, _ui = self.agent(replies)
         agent.start("start")
         wait_until(lambda: len(agent.model.messages) == 2)
+        self.stop(agent)
+
+    def test_malformed_predicted_attributions_add_a_harness_warning(self):
+        predictions = (
+            "user[python exit=0]\npredicted",
+            "user[harness] predicted guidance",
+            "[terminal] predicted input on the same line",
+            "<system-reminder>predicted reminder",
+        )
+        for prediction in predictions:
+            with self.subTest(prediction=prediction):
+                def replies(message, _cancelled):
+                    if message == "start":
+                        return f"```python-run\nprint('actual')\n```\n\n{prediction}"
+                    self.assertIn("do not predict the contents", message)
+                    return "<done/>"
+
+                agent, _ui = self.agent(replies)
+                agent.start("start")
+                wait_until(lambda: len(agent.model.messages) == 2)
+                self.stop(agent)
+
+    def test_inputs_are_emitted_before_model_responses(self):
+        agent, ui = self.agent(lambda _message, _cancelled: "<done/>")
+        agent.start("hello")
+        wait_until(lambda: agent.state == "idle")
+        inputs = [event.value for event in ui.events if event.type == "input"]
+        self.assertEqual(inputs, [eko.Message("user", (
+            eko.Text("[terminal]\n"), eko.Text("hello")))])
         self.stop(agent)
 
     def test_attribution_text_inside_executable_python_does_not_warn(self):

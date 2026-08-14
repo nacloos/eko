@@ -79,6 +79,9 @@ NUDGE = "Write a fenced ```python-run block, or <done/> if the prompt is resolve
 FERAL_NUDGE = "Write a fenced ```python-run block."
 NORMAL_MODE = (" If no action is needed, answer directly. When the prompt is "
                "fully resolved, end with <done/> and no Python block.")
+FAREWELL = "Final turn before reset."
+CONTEXT_NOTICES = (.50, .90)
+RESET_AT = .95
 MAX_INPUT_TEXT = 20_000
 TIMEOUT = 600
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -160,7 +163,7 @@ class Eko:
     def __init__(self, cwd: Path, model, feral: bool = False,
                  socket_path: Path | None = None,
                  observer: Callable[[Event], None] | None = None,
-                 name: str = NAME) -> None:
+                 name: str = NAME, context: int = 0) -> None:
         self.cwd = cwd.resolve()
         self.feral = feral
         self.observer = observer or (lambda _event: None)
@@ -169,6 +172,10 @@ class Eko:
         self.system = SYSTEM.format(
             name=name, folder=self.cwd, mode=mode)
         self.messages: list[Message] = []
+        self.context = context
+        self.context_notice = 0
+        self.opening_inputs: tuple[Input, ...] | None = None
+        self.reset_pending = False
         self.inbox: queue.Queue[Input | None] = queue.Queue()
         self.stopping = threading.Event()
         self.interrupted = threading.Event()
@@ -293,6 +300,8 @@ class Eko:
                     inputs = self._receive()
                     if inputs is None:
                         return
+                    if self.opening_inputs is None:
+                        self.opening_inputs = inputs
                 try:
                     self._set_state("thinking")
                     message = user_message(tuple(
@@ -329,13 +338,36 @@ class Eko:
                         output = result.output or "(no output)"
                         inputs = (Input(
                             PYTHON, (Text(output),), result.returncode),)
-                    if inputs is not None:
-                        inputs += self._drain()
+                    if self.reset_pending:
+                        self.model.reset(self.system)
+                        self.messages.clear()
+                        self.context_notice = 0
+                        self.reset_pending = False
+                        assert self.opening_inputs is not None
+                        inputs = self.opening_inputs + self._drain()
+                    elif inputs is not None:
                         if predicted:
                             inputs += (Input(HARNESS, (Text(
                                 "Warning: do not predict the contents of attributed "
                                 "sections; wait for them to arrive."
                             ),)),)
+                        if self.context and code is not None:
+                            used = getattr(self.model, "context_used", 0)
+                            ratio = used / self.context
+                            if ratio >= RESET_AT:
+                                inputs = (Input(HARNESS, (Text(FAREWELL),)),)
+                                self.reset_pending = True
+                            else:
+                                inputs += self._drain()
+                                notice = max((threshold for threshold in CONTEXT_NOTICES
+                                              if ratio >= threshold), default=0)
+                                if notice > self.context_notice:
+                                    inputs += (Input(HARNESS, (Text(
+                                        context_status_line(used, self.context)
+                                    ),)),)
+                                    self.context_notice = notice
+                        else:
+                            inputs += self._drain()
                 except InterruptedError:
                     self._emit(Event("error", "Interrupted"))
                     inputs = None
@@ -551,6 +583,13 @@ def message_text(message: Message) -> str:
     return "".join(part.text for part in message.content if isinstance(part, Text))
 
 
+def context_status_line(used: int, capacity: int) -> str:
+    """Return compact context usage without resembling a provenance header."""
+    percent = round(100 * used / capacity) if capacity else 0
+    return (f"context {used / 1000:.0f}k/{capacity / 1000:.0f}k "
+            f"({percent}%)")
+
+
 # ── Python execution ─────────────────────────────────────────────────────────
 
 def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
@@ -673,10 +712,15 @@ class Model:
     """One model conversation carried by one Unix socket connection."""
 
     def __init__(self, endpoint: Path) -> None:
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.connect(str(endpoint))
-        self.reader = self.socket.makefile("rb")
+        self.endpoint = endpoint
         self.write_lock = threading.Lock()
+        self.context_used = 0
+        self._connect()
+
+    def _connect(self) -> None:
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.connect(str(self.endpoint))
+        self.reader = self.socket.makefile("rb")
 
     def _send(self, value: dict) -> None:
         with self.write_lock:
@@ -693,6 +737,7 @@ class Model:
             if "delta" in event:
                 on_text(event["delta"])
             elif "message" in event:
+                self.context_used = int(event.get("context_used") or 0)
                 return decode_message(event["message"])
             elif "error" in event:
                 if event.get("interrupted"):
@@ -705,6 +750,12 @@ class Model:
             self._send({"interrupt": True})
         except OSError:
             pass
+
+    def reset(self, system: str) -> None:
+        self.close()
+        self._connect()
+        self.context_used = 0
+        self.start(system)
 
     def close(self) -> None:
         try:
@@ -747,7 +798,7 @@ def decode_event(raw: dict) -> Event:
 
 def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           feral: bool = False, name: str = NAME,
-          socket_path: Path | None = None) -> None:
+          socket_path: Path | None = None, context: int = 0) -> None:
     """Run the agent using JSON-lines stdin, stdout, and model socket."""
     if os.getpid() == 1:
         threading.Thread(target=_reap_children, daemon=True).start()
@@ -761,7 +812,8 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
 
     agent = Eko(
         cwd, Model(model_socket), feral, socket_path=socket_path,
-        observer=lambda event: write(encode_event(event)), name=name)
+        observer=lambda event: write(encode_event(event)), name=name,
+        context=context)
     agent.start(prompt)
     write({"type": "ready", "session": str(agent.socket_path)})
     try:
@@ -800,6 +852,7 @@ def main() -> None:
     parser.add_argument("--session-socket", type=Path)
     parser.add_argument("--name", default=NAME)
     parser.add_argument("--feral", action="store_true")
+    parser.add_argument("--context", type=int, default=0)
     args = parser.parse_args()
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
@@ -807,7 +860,7 @@ def main() -> None:
     if args.model_socket is None:
         parser.error("no model service; set EKO_MODEL")
     serve(cwd, args.model_socket, prompt=args.prompt, feral=args.feral,
-          name=args.name, socket_path=args.session_socket)
+          name=args.name, socket_path=args.session_socket, context=args.context)
 
 
 if __name__ == "__main__":
