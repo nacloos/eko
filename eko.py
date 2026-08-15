@@ -171,7 +171,8 @@ class Eko:
                  observer: Callable[[Event], None] | None = None,
                  name: str = NAME, context: int = 0,
                  clean_workspace: bool = False,
-                 python_timeout: float = PYTHON_TIMEOUT) -> None:
+                 python_timeout: float = PYTHON_TIMEOUT,
+                 max_turns: int = 0) -> None:
         self.cwd = cwd.resolve()
         self.feral = feral
         self.observer = observer or (lambda _event: None)
@@ -184,6 +185,7 @@ class Eko:
         self.messages: list[Message] = []
         self.context = context
         self.python_timeout = python_timeout
+        self.max_turns = max_turns
         self.context_notice = 0
         self.opening_inputs: tuple[Input, ...] | None = None
         self.reset_pending = False
@@ -353,6 +355,8 @@ class Eko:
                     self._emit(Event("response", (response, None)))
 
                     if "<done/>" in response and not self.feral:
+                        inputs = None
+                    elif self.max_turns:
                         inputs = None
                     elif not acted:
                         inputs = (Input(HARNESS, (Text(
@@ -719,12 +723,13 @@ class Model:
 
     def __init__(self, endpoint: Path, model: str | None = None,
                  effort: str | None = None, session_id: str | None = None,
-                 resume: bool = False) -> None:
+                 resume: bool = False, max_turns: int = 0) -> None:
         self.endpoint = endpoint
         self.model = model
         self.effort = effort
         self.session_id = session_id
         self.resume_session = resume
+        self.max_turns = max_turns
         self.write_lock = threading.Lock()
         self.context_used = 0
         self._connect()
@@ -748,6 +753,8 @@ class Model:
             hello["session_id"] = self.session_id
         if self.resume_session:
             hello["resume"] = True
+        if self.max_turns:
+            hello["max_turns"] = self.max_turns
         self._send(hello)
 
     def send(self, message: Message, on_text: Callable[[str], None],
@@ -835,7 +842,8 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           clean_workspace: bool = False, model: str | None = None,
           effort: str | None = None, session_id: str | None = None,
           resume: bool = False,
-          python_timeout: float = PYTHON_TIMEOUT) -> None:
+          python_timeout: float = PYTHON_TIMEOUT,
+          max_turns: int = 0) -> None:
     """Run the agent using JSON-lines stdin, stdout, and model socket."""
     if os.getpid() == 1:
         threading.Thread(target=_reap_children, daemon=True).start()
@@ -848,11 +856,12 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
             sys.stdout.flush()
 
     agent = Eko(
-        cwd, Model(model_socket, model, effort, session_id, resume), feral,
+        cwd, Model(model_socket, model, effort, session_id, resume,
+                   max_turns), feral,
         socket_path=socket_path,
         observer=lambda event: write(encode_event(event)), name=name,
         context=context, clean_workspace=clean_workspace,
-        python_timeout=python_timeout)
+        python_timeout=python_timeout, max_turns=max_turns)
     agent.start(prompt)
     write({"type": "ready", "session": str(agent.socket_path)})
     try:
@@ -902,11 +911,17 @@ def main() -> None:
         default=float(os.environ.get("EKO_PYTHON_TIMEOUT", PYTHON_TIMEOUT)),
         help=f"maximum seconds per Python action (default: {PYTHON_TIMEOUT:g})",
     )
+    parser.add_argument(
+        "--max-turns", type=int, default=0,
+        help="stop a model response after this many model turns (0: unlimited)",
+    )
     # Temporary experiment flag; remove after the workspace-hygiene evaluation.
     parser.add_argument("--clean-workspace", action="store_true")
     args = parser.parse_args()
     if args.python_timeout <= 0:
         parser.error("--python-timeout must be greater than zero")
+    if args.max_turns < 0:
+        parser.error("--max-turns must not be negative")
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
         parser.error(f"not a directory: {cwd}")
@@ -916,7 +931,8 @@ def main() -> None:
           name=args.name, socket_path=args.session_socket, context=args.context,
           clean_workspace=args.clean_workspace, model=args.model,
           effort=args.effort, session_id=args.session_id or args.resume,
-          resume=args.resume is not None, python_timeout=args.python_timeout)
+          resume=args.resume is not None, python_timeout=args.python_timeout,
+          max_turns=args.max_turns)
 
 
 if __name__ == "__main__":

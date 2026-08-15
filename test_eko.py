@@ -63,6 +63,7 @@ class FakeModel:
         self.cancelled = threading.Event()
         self.context_used = 0
         self.resets = 0
+        self.max_turns = None
 
     def start(self, system):
         self.system = system
@@ -84,7 +85,9 @@ class FakeModel:
         write(reply)
         return eko.Message("assistant", (eko.Text(reply),))
 
-    def complete(self, system, message, write, python=lambda _code: None):
+    def complete(self, system, message, write, python=lambda _code: None,
+                 max_turns=0):
+        self.max_turns = max_turns
         self.start(system)
         return self.send(message, write, python)
 
@@ -354,7 +357,7 @@ class ModelSocketTests(unittest.TestCase):
                 thread.start()
                 remote = eko.Model(
                     endpoint, "thinkingmachines/Inkling-Small", "low",
-                    session_id, True)
+                    session_id, True, 1)
                 remote.start(eko.SYSTEM)
                 reply = remote.send(conversation("hello")[0], lambda _: None)
                 remote.close()
@@ -365,6 +368,8 @@ class ModelSocketTests(unittest.TestCase):
             Path.cwd(), "thinkingmachines/Inkling-Small", "low",
             session_id, True)
         self.assertEqual(reply, eko.Message("assistant", (eko.Text("HELLO"),)))
+        self.assertEqual(model.max_turns, 1)
+        self.assertFalse(model.cancelled.is_set())
 
     def test_message_socket_round_trips_images(self):
         message = eko.Message("user", (
@@ -872,6 +877,32 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_claude_max_turn_boundary_flushes_process_before_returning(self):
+        model = host.Claude(Path.cwd(), "fake", "low")
+        payload = json.dumps({
+            "type": "result", "subtype": "error_max_turns",
+            "is_error": True, "usage": {"input_tokens": 3},
+        }) + "\n"
+
+        def start(_system, _max_turns):
+            script = ("import sys; sys.stdin.buffer.readline(); "
+                      f"sys.stdout.buffer.write({payload.encode()!r}); "
+                      "sys.stdout.buffer.flush(); sys.stdin.buffer.read()")
+            model.proc = subprocess.Popen(
+                [sys.executable, "-c", script], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+            model.started = True
+
+        model._start = start
+        reply = model.complete(
+            eko.SYSTEM, conversation("one turn")[0], lambda _: None,
+            max_turns=1)
+
+        self.assertEqual(reply, eko.Message("assistant", ()))
+        self.assertIsNone(model.proc)
+        self.assertEqual(model.context_used, 3)
+        model.close()
+
     def test_agent_command_forwards_python_timeout(self):
         command = host._agent_command(
             Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,
@@ -880,6 +911,15 @@ class ModelTests(unittest.TestCase):
 
         index = command.index("--python-timeout")
         self.assertEqual(command[index + 1], "12.5")
+
+    def test_agent_command_forwards_max_turns(self):
+        command = host._agent_command(
+            Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,
+            name="Eko", max_turns=1,
+        )
+
+        index = command.index("--max-turns")
+        self.assertEqual(command[index + 1], "1")
 
     def test_agent_command_forwards_clean_workspace_flag(self):
         command = host._agent_command(

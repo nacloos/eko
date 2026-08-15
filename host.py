@@ -520,7 +520,8 @@ def _model_client(connection: socket.socket, cwd: Path,
             assert conversation is not None
             reply = conversation.complete(
                 system, core.decode_message(message),
-                lambda text: send({"delta": text}), python)
+                lambda text: send({"delta": text}), python,
+                max_turns=max_turns)
             send({"message": core.encode_message(reply),
                   "context_used": conversation.context_used})
         except InterruptedError:
@@ -541,12 +542,16 @@ def _model_client(connection: socket.socket, cwd: Path,
                 requested_effort = initial.get("effort", effort)
                 requested_session = initial.get("session_id", session_id)
                 requested_resume = initial.get("resume", resume)
+                max_turns = initial.get("max_turns", 0)
                 if (not isinstance(requested_model, str)
                         or (requested_effort is not None
                             and not isinstance(requested_effort, str))
                         or (requested_session is not None
                             and not isinstance(requested_session, str))
-                        or not isinstance(requested_resume, bool)):
+                        or not isinstance(requested_resume, bool)
+                        or not isinstance(max_turns, int)
+                        or isinstance(max_turns, bool)
+                        or max_turns < 0):
                     return
                 conversation = (
                     Claude(cwd, requested_model, requested_effort or "high",
@@ -582,9 +587,11 @@ def _model_client(connection: socket.socket, cwd: Path,
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return
     finally:
-        if conversation is not None:
-            conversation.interrupt()
         if active is not None:
+            active.join(1)
+        if (conversation is not None and active is not None
+                and active.is_alive()):
+            conversation.interrupt()
             active.join(2)
         if conversation is not None:
             conversation.close()
@@ -759,6 +766,7 @@ def _package_mounts(environment: Path, base: Path) -> tuple[list[str], list[str]
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    feral: bool, name: str, context: int = 0,
                    python_timeout: float = core.PYTHON_TIMEOUT,
+                   max_turns: int = 0,
                    clean_workspace: bool = False, model: str | None = None,
                    effort: str | None = None, session_id: str | None = None,
                    resume: bool = False) -> list[str]:
@@ -769,6 +777,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                  "--session-socket",
                  "/run/eko/session.sock" if sandbox else str(runtime / "session.sock"),
                  "--name", name, "--python-timeout", str(python_timeout)]
+    if max_turns:
+        arguments.extend(("--max-turns", str(max_turns)))
     if model is not None:
         arguments.extend(("--model", model))
     if effort is not None:
@@ -835,7 +845,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         world_socket: Path | None = None, session_id: str | None = None,
         resume: bool = False, context: int = 0,
         clean_workspace: bool = False,
-        python_timeout: float = core.PYTHON_TIMEOUT) -> None:
+        python_timeout: float = core.PYTHON_TIMEOUT,
+        max_turns: int = 0) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -862,7 +873,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             _agent_command(
                 cwd, runtime, sandbox=sandbox, feral=feral, name=name,
                 context=context, clean_workspace=clean_workspace,
-                python_timeout=python_timeout,
+                python_timeout=python_timeout, max_turns=max_turns,
                 model=model, effort=effort, session_id=session_id, resume=resume
             ),
             env=environment,
@@ -914,6 +925,10 @@ def main() -> None:
         "--python-timeout", type=float, default=core.PYTHON_TIMEOUT,
         help=f"maximum seconds per Python action (default: {core.PYTHON_TIMEOUT:g})",
     )
+    parser.add_argument(
+        "--max-turns", type=int, default=0,
+        help="stop a model response after this many model turns (0: unlimited)",
+    )
     # Temporary experiment flag; remove after the workspace-hygiene evaluation.
     parser.add_argument("--clean-workspace", action="store_true")
     parser.add_argument("--headless", action="store_true")
@@ -936,6 +951,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.python_timeout <= 0:
         parser.error("--python-timeout must be greater than zero")
+    if args.max_turns < 0:
+        parser.error("--max-turns must not be negative")
 
     def launch(cwd: Path) -> None:
         run(cwd, args.prompt, model=args.model, effort=args.effort,
@@ -944,7 +961,7 @@ def main() -> None:
             session_id=args.session_id or args.resume,
             resume=args.resume is not None, context=args.context,
             clean_workspace=args.clean_workspace,
-            python_timeout=args.python_timeout)
+            python_timeout=args.python_timeout, max_turns=args.max_turns)
 
     try:
         if args.feral and args.cwd is None:

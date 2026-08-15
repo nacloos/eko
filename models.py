@@ -214,7 +214,8 @@ class Tinker:
 
     def complete(self, system: str, message: core.Message,
                  on_text: Callable[[str], None],
-                 on_python: Callable[[str], core.Result]) -> core.Message:
+                 on_python: Callable[[str], core.Result],
+                 max_turns: int = 0) -> core.Message:
         if message.role != "user":
             raise ValueError("model input must be a user message")
         if self.system is None:
@@ -230,8 +231,10 @@ class Tinker:
         options = ({"effort": EFFORT[self.effort]}
                    if self.effort is not None else {})
         messages = [*self.messages, user]
+        turn_count = 0
         import tinker
         while True:
+            turn_count += 1
             prompt = renderer.build_generation_prompt(messages, **options)
             future = client.sample(
                 prompt, num_samples=1,
@@ -276,6 +279,12 @@ class Tinker:
                     "tool_call_id": call.id or "",
                     "content": tinker_tool_content(result),
                 })
+            if max_turns and turn_count >= max_turns:
+                self._save(messages)
+                self.messages = messages
+                self.context_used = sum(
+                    int(chunk.length) for chunk in prompt.chunks)
+                return core.Message("assistant", ())
         self._save(messages)
         self.messages = messages
         self.context_used = sum(int(chunk.length) for chunk in prompt.chunks)
@@ -478,7 +487,7 @@ class Claude:
                 return True
         return False
 
-    def _start(self, system: str) -> None:
+    def _start(self, system: str, max_turns: int = 0) -> None:
         session = (["--resume", self.session_id] if self.started else
                    ["--session-id", self.session_id])
         config = json.dumps({"mcpServers": {"eko": {
@@ -493,6 +502,7 @@ class Claude:
             "--setting-sources", "", "--settings", "{}",
             "--disable-slash-commands",
             "--model", self.model, "--effort", self.effort,
+            *(["--max-turns", str(max_turns)] if max_turns else []),
             *session,
             "--input-format", "stream-json", "--output-format", "stream-json",
             "--include-partial-messages",
@@ -534,11 +544,33 @@ class Claude:
                 stream.close()
         self.proc = None
 
+    def _finish(self) -> None:
+        """Close a completed CLI input stream and wait for session persistence."""
+        proc = self.proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                    proc.stdin = None
+                proc.wait(timeout=3)
+            except (BrokenPipeError, subprocess.TimeoutExpired):
+                self._terminate(signal.SIGTERM)
+                return
+        for stream in (getattr(proc, "stdout", None),
+                       getattr(proc, "stderr", None)):
+            if stream is not None and not stream.closed:
+                stream.close()
+        if self.proc is proc:
+            self.proc = None
+
     def complete(self, system: str, message: core.Message,
                  on_text: Callable[[str], None],
                  on_python: Callable[[str], core.Result] | None = None,
                  deadline: float | None = None,
-                 retry_delay: float = .2) -> core.Message:
+                 retry_delay: float = .2,
+                 max_turns: int = 0) -> core.Message:
         """Complete a history using the CLI's internally persisted conversation."""
         if message.role != "user":
             raise ValueError("model input must be a user message")
@@ -546,7 +578,10 @@ class Claude:
         deadline = deadline or time.monotonic() + CALL_TIMEOUT
         resuming = self.started
         if self.proc is None or self.proc.poll() is not None:
-            self._start(system)
+            if max_turns:
+                self._start(system, max_turns)
+            else:
+                self._start(system)
         proc = self.proc
         assert proc is not None and proc.stdin and proc.stdout
         event = {"type": "user", "message": {
@@ -585,6 +620,17 @@ class Claude:
             elif data.get("type") == "result":
                 with self.broker.lock:
                     self.broker.handler = None
+                if data.get("subtype") == "error_max_turns" and max_turns:
+                    usage = data.get("usage") or {}
+                    self.context_used = (int(usage["prompt_tokens"])
+                                         if usage.get("prompt_tokens") is not None
+                                         else sum(int(usage.get(name) or 0)
+                                                  for name in (
+                                                      "input_tokens",
+                                                      "cache_read_input_tokens",
+                                                      "cache_creation_input_tokens")))
+                    self._finish()
+                    return core.Message("assistant", ())
                 if data.get("is_error"):
                     detail = data.get("result") or data.get("error")
                     if resuming:
@@ -595,7 +641,7 @@ class Claude:
                                 and self._repair_session()):
                             return self.complete(
                                 system, message, on_text, on_python,
-                                deadline, retry_delay)
+                                deadline, retry_delay, max_turns)
                         remaining = deadline - time.monotonic()
                         if remaining > 0 and not parts and not complete:
                             delay = min(retry_delay, remaining)
@@ -604,7 +650,7 @@ class Claude:
                             if time.monotonic() < deadline:
                                 return self.complete(
                                     system, message, on_text, on_python, deadline,
-                                    min(retry_delay * 2, 5))
+                                    min(retry_delay * 2, 5), max_turns)
                         raise RuntimeError(
                             "Model session could not resume; context was not "
                             f"reset. {detail or ''}".rstrip())
@@ -621,23 +667,10 @@ class Claude:
 
     def close(self) -> None:
         """Give the CLI a brief chance to flush its session, then stop it."""
-        proc = self.proc
-        if proc is None:
+        if self.proc is None:
             self.broker.close()
             return
-        if proc.poll() is None:
-            try:
-                assert proc.stdin
-                proc.stdin.close()
-                proc.stdin = None
-                proc.wait(timeout=3)
-            except (BrokenPipeError, subprocess.TimeoutExpired):
-                self._terminate(signal.SIGTERM)
-                return
-        if proc.stdout:
-            proc.stdout.close()
-        if self.proc is proc:
-            self.proc = None
+        self._finish()
         self.broker.close()
 
     def interrupt(self) -> None:
