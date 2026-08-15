@@ -775,6 +775,7 @@ def _mount_parents(path: Path) -> list[str]:
 
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    feral: bool, name: str, context: int = 0,
+                   python_timeout: float = core.PYTHON_TIMEOUT,
                    clean_workspace: bool = False) -> list[str]:
     source = Path(core.__file__).resolve()
     arguments = ["--cwd", "/workspace" if sandbox else str(cwd),
@@ -782,7 +783,7 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                  "/run/eko/model.sock" if sandbox else str(runtime / "model.sock"),
                  "--session-socket",
                  "/run/eko/session.sock" if sandbox else str(runtime / "session.sock"),
-                 "--name", name]
+                 "--name", name, "--python-timeout", str(python_timeout)]
     if context:
         arguments.extend(("--context", str(context)))
     if clean_workspace:
@@ -852,7 +853,8 @@ def run(cwd: Path, prompt: str | None, *, model: str | None, effort: str | None,
         feral: bool, name: str, headless: bool, sandbox: bool,
         world_socket: Path | None = None, session_id: str | None = None,
         resume: bool = False, context: int = 0,
-        clean_workspace: bool = False) -> None:
+        clean_workspace: bool = False,
+        python_timeout: float = core.PYTHON_TIMEOUT) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -880,7 +882,8 @@ def run(cwd: Path, prompt: str | None, *, model: str | None, effort: str | None,
         agent = AgentProcess(
             _agent_command(
                 cwd, runtime, sandbox=sandbox, feral=feral, name=name,
-                context=context, clean_workspace=clean_workspace
+                context=context, clean_workspace=clean_workspace,
+                python_timeout=python_timeout
             ),
             env=environment,
         )
@@ -931,6 +934,10 @@ def main() -> None:
         help="reasoning effort, when supported by the selected renderer")
     parser.add_argument("--name", default=core.NAME)
     parser.add_argument("--context", type=int, default=0)
+    parser.add_argument(
+        "--python-timeout", type=float, default=core.PYTHON_TIMEOUT,
+        help=f"maximum seconds per Python action (default: {core.PYTHON_TIMEOUT:g})",
+    )
     # Temporary experiment flag; remove after the workspace-hygiene evaluation.
     parser.add_argument("--clean-workspace", action="store_true")
     parser.add_argument("--headless", action="store_true")
@@ -951,6 +958,8 @@ def main() -> None:
         "--resume", metavar="UUID", help="resume the primary conversation UUID"
     )
     args = parser.parse_args()
+    if args.python_timeout <= 0:
+        parser.error("--python-timeout must be greater than zero")
 
     def launch(cwd: Path) -> None:
         run(cwd, args.prompt, model=args.model, effort=args.effort,
@@ -958,7 +967,8 @@ def main() -> None:
             sandbox=args.sandbox, world_socket=args.world_socket,
             session_id=args.session_id or args.resume,
             resume=args.resume is not None, context=args.context,
-            clean_workspace=args.clean_workspace)
+            clean_workspace=args.clean_workspace,
+            python_timeout=args.python_timeout)
 
     try:
         if args.feral and args.cwd is None:

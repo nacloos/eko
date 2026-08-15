@@ -48,6 +48,9 @@ uv run --script host.py --headless --cwd ~/projects/my-project "Fix the tests"
 uv run --script host.py --sandbox --cwd ~/projects/my-project
 ```
 
+Python actions time out after 30 seconds by default. Override this for either the
+included host or the provider-neutral agent with `--python-timeout SECONDS`.
+
 Feral mode starts immediately and keeps acting autonomously. When `--cwd` is
 omitted, it runs in a fresh empty workspace that is deleted when Eko exits. Pass
 `--cwd` explicitly when the agent should access a persistent project:
