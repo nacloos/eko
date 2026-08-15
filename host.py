@@ -1,8 +1,9 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "prompt-toolkit>=3.0,<4",
 #     "rich>=13,<15",
+#     "tinker-cookbook>=0.1,<1",
 # ]
 # ///
 
@@ -11,11 +12,9 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import io
 import json
 import os
-import select
 import shutil
 import signal
 import socket
@@ -31,6 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 import eko as core
+from tinker_model import DEFAULT_MODEL, EFFORT, Tinker, ensure_auth as ensure_tinker_auth
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.document import Document
@@ -45,250 +45,6 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text as RichText
-
-# ── Claude model connection ───────────────────────────────────────────────────
-
-CALL_TIMEOUT = 300
-
-
-def _claude_content(message: core.Message) -> list[dict]:
-    """Serialize provider-neutral content as Claude blocks."""
-    blocks: list[dict] = []
-    for part in message.content:
-        if isinstance(part, core.Text):
-            blocks.append({"type": "text", "text": part.text})
-        else:
-            if part.name:
-                blocks.append({"type": "text", "text": f"Image: {part.name}"})
-            blocks.append({"type": "image", "source": {
-                "type": "base64", "media_type": part.media_type,
-                "data": base64.b64encode(part.data).decode(),
-            }})
-    return blocks
-
-
-class Claude:
-    """A persistent, tool-free connection to the LLM through the Claude CLI.
-
-    Stream JSON lets several Eko turns share one model conversation. ``--safe-mode``
-    prevents machine-specific instructions, hooks, plugins, and skills from changing
-    the model's context, while ``--tools ''`` leaves generated Python as its only action.
-    """
-
-    def __init__(self, cwd: Path, model: str = "claude-opus-5",
-                 effort: str = "high", session_id: str | None = None,
-                 resume: bool = False) -> None:
-        self.cwd = cwd
-        self.model = model
-        self.effort = effort
-        self.session_id = session_id or str(uuid.uuid4())
-        uuid.UUID(self.session_id)
-        self.proc: subprocess.Popen[bytes] | None = None
-        self.started = resume
-        self.interrupted = threading.Event()
-        self.context_used = 0
-
-    def _repair_session(self) -> bool:
-        """Repair this session's empty assistant text blocks."""
-        config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
-        projects = config / "projects"
-        if not projects.is_dir():
-            return False
-        for path in projects.glob(f"*/{self.session_id}.jsonl"):
-            lines = path.read_text().splitlines(keepends=True)
-            changed = False
-            for index, line in enumerate(lines):
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("type") != "assistant":
-                    continue
-                content = record.get("message", {}).get("content", [])
-                repaired = False
-                for block in content:
-                    if block.get("type") == "text" and block.get("text") == "":
-                        block["text"] = " "
-                        repaired = changed = True
-                if repaired:
-                    ending = "\n" if line.endswith("\n") else ""
-                    lines[index] = json.dumps(record, separators=(",", ":")) + ending
-            if changed:
-                temporary = path.with_suffix(".jsonl.tmp")
-                temporary.write_text("".join(lines))
-                os.replace(temporary, path)
-                return True
-        return False
-
-    def _start(self, system: str) -> None:
-        session = (["--resume", self.session_id] if self.started else
-                   ["--session-id", self.session_id])
-        command = [
-            "claude", "-p", "--verbose", "--safe-mode", "--tools", "",
-            "--model", self.model, "--effort", self.effort,
-            *session,
-            "--input-format", "stream-json", "--output-format", "stream-json",
-            "--include-partial-messages",
-            "--system-prompt", system,
-        ]
-        self.proc = subprocess.Popen(
-            command, cwd=self.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
-        self.started = True
-
-    def _terminate(self, signum: int, grace: float = 2) -> None:
-        """Signal the CLI process group and ensure it is collected."""
-        if self.proc is None:
-            return
-        if self.proc.poll() is None:
-            try:
-                os.killpg(self.proc.pid, signum)
-            except ProcessLookupError:
-                pass
-            try:
-                self.proc.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.proc.wait()
-        self.proc = None
-
-    def complete(self, system: str, message: core.Message,
-                 on_text: Callable[[str], None],
-                 deadline: float | None = None,
-                 retry_delay: float = .2) -> core.Message:
-        """Complete a history using the CLI's internally persisted conversation."""
-        if message.role != "user":
-            raise ValueError("model input must be a user message")
-        self.interrupted.clear()
-        deadline = deadline or time.monotonic() + CALL_TIMEOUT
-        resuming = self.started
-        if self.proc is None or self.proc.poll() is not None:
-            self._start(system)
-        proc = self.proc
-        assert proc is not None and proc.stdin and proc.stdout
-        event = {"type": "user", "message": {
-            "role": "user", "content": _claude_content(message)}}
-        proc.stdin.write((json.dumps(event) + "\n").encode())
-        proc.stdin.flush()
-
-        parts: list[str] = []
-        complete = ""
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [proc.stdout], [], [], max(0, deadline - time.monotonic()))
-            if not ready:
-                break
-            line = proc.stdout.readline()
-            if not line:
-                if self.interrupted.is_set():
-                    raise InterruptedError
-                break
-            if not line.startswith(b"{"):
-                continue
-            data = json.loads(line)
-            if data.get("type") == "stream_event":
-                event = data.get("event", {})
-                delta = event.get("delta", {})
-                if (event.get("type") == "content_block_delta"
-                        and delta.get("type") == "text_delta"):
-                    text = delta.get("text", "")
-                    parts.append(text)
-                    on_text(text)
-            elif data.get("type") == "assistant":
-                complete = "".join(
-                    block["text"] for block in data["message"].get("content", [])
-                    if block.get("type") == "text")
-            elif data.get("type") == "result":
-                if data.get("is_error"):
-                    detail = data.get("result") or data.get("error")
-                    if resuming:
-                        self._terminate(signal.SIGTERM)
-                        proc.stdin.close()
-                        proc.stdout.close()
-                        if ("text content blocks must be non-empty" in str(detail)
-                                and self._repair_session()):
-                            return self.complete(
-                                system, message, on_text, deadline, retry_delay)
-                        remaining = deadline - time.monotonic()
-                        if remaining > 0 and not parts and not complete:
-                            delay = min(retry_delay, remaining)
-                            if self.interrupted.wait(delay):
-                                raise InterruptedError
-                            if time.monotonic() < deadline:
-                                return self.complete(
-                                    system, message, on_text, deadline,
-                                    min(retry_delay * 2, 5))
-                        raise RuntimeError(
-                            "Model session could not resume; context was not "
-                            f"reset. {detail or ''}".rstrip())
-                    raise RuntimeError(detail or "Model call failed")
-                usage = data.get("usage") or {}
-                self.context_used = (int(usage["prompt_tokens"])
-                                     if usage.get("prompt_tokens") is not None else
-                                     sum(int(usage.get(name) or 0) for name in (
-                                         "input_tokens", "cache_read_input_tokens",
-                                         "cache_creation_input_tokens")))
-                return core.Message(
-                    "assistant", (core.Text(complete or "".join(parts)),))
-        raise RuntimeError("Model produced no result")
-
-    def close(self) -> None:
-        """Give the CLI a brief chance to flush its session, then stop it."""
-        proc = self.proc
-        if proc is None:
-            return
-        if proc.poll() is None:
-            try:
-                assert proc.stdin
-                proc.stdin.close()
-                proc.stdin = None
-                proc.wait(timeout=3)
-            except (BrokenPipeError, subprocess.TimeoutExpired):
-                self._terminate(signal.SIGTERM)
-                return
-        if proc.stdout:
-            proc.stdout.close()
-        if self.proc is proc:
-            self.proc = None
-
-    def interrupt(self) -> None:
-        self.interrupted.set()
-        self._terminate(signal.SIGKILL)
-
-
-# ── Claude authentication ─────────────────────────────────────────────────────
-
-def auth_status() -> bool:
-    """Return whether the Claude CLI can access the model."""
-    if shutil.which("claude") is None:
-        raise SystemExit("Claude Code is not installed or is not on PATH.")
-    status = subprocess.run(
-        ["claude", "auth", "status", "--json"], text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if status.returncode:
-        return False
-    try:
-        data = json.loads(status.stdout)
-        return bool(data.get("loggedIn"))
-    except json.JSONDecodeError:
-        return False
-
-
-def ensure_auth() -> None:
-    """Let the official CLI own sign-in; Eko never reads or stores credentials."""
-    if auth_status():
-        return
-    print("Claude Code is not signed in.")
-    answer = input("Press Enter to sign in, or q to exit: ").strip().lower()
-    if answer == "q":
-        raise SystemExit(0)
-    subprocess.run(["claude", "auth", "login", "--claudeai"], check=False)
-    if not auth_status():
-        raise SystemExit("Claude sign-in did not complete.")
-
 
 # ── Terminal rendering ────────────────────────────────────────────────────────
 
@@ -668,15 +424,19 @@ class UI:
             done.wait(2)
         return 0
 
-    def header(self, cwd: Path, model: str, name: str = core.NAME) -> None:
-        header = Group(RichText(name, style=f"bold {GOLD}"), RichText.assemble(
+    def header(self, cwd: Path, model: str, name: str = core.NAME,
+               session_id: str | None = None) -> None:
+        lines = [RichText(name, style=f"bold {GOLD}"), RichText.assemble(
             (str(cwd), "dim"), ("  ·  ", "dim"), (model, "dim"),
-            ("  ·  signed in", "dim")), RichText(""))
+            ("  ·  signed in", "dim"))]
+        if session_id:
+            lines.append(RichText(f"session {session_id}", style="dim"))
+        header = Group(*lines, RichText(""))
         # Place the initial composer near the bottom. These are real terminal
         # lines, so subsequent turns naturally replace them and enter native
         # scrollback instead of making a full-screen spacer jump around.
         padding = max(
-            0, shutil.get_terminal_size().lines - 9)
+            0, shutil.get_terminal_size().lines - 9 - bool(session_id))
         self._append(self._render(header) + "\n" * padding)
 
     def user(self, text: str) -> None:
@@ -817,10 +577,10 @@ class AgentProcess:
 
 
 def _model_client(connection: socket.socket, cwd: Path,
-                  model: str, effort: str, session_id: str | None = None,
+                  model: str | None, effort: str | None, session_id: str | None = None,
                   resume: bool = False) -> None:
-    """Give one agent connection an independent Claude conversation."""
-    claude = Claude(cwd, model, effort, session_id, resume)
+    """Give one agent connection an independent Tinker conversation."""
+    tinker = Tinker(cwd, model, effort, session_id, resume)
     lock = threading.Lock()
     active: threading.Thread | None = None
 
@@ -834,11 +594,11 @@ def _model_client(connection: socket.socket, cwd: Path,
 
     def complete(message: dict) -> None:
         try:
-            reply = claude.complete(
+            reply = tinker.complete(
                 system, core.decode_message(message),
                 lambda text: send({"delta": text}))
             send({"message": core.encode_message(reply),
-                  "context_used": claude.context_used})
+                  "context_used": tinker.context_used})
         except InterruptedError:
             send({"error": "Interrupted", "interrupted": True})
         except Exception as error:
@@ -846,30 +606,37 @@ def _model_client(connection: socket.socket, cwd: Path,
 
     try:
         with connection, connection.makefile("rb") as reader:
-            initial = json.loads(reader.readline())
-            system = initial.get("system")
-            if not isinstance(system, str):
-                raise ValueError("first model event must contain system")
-            while line := reader.readline():
-                request = json.loads(line)
-                if request.get("interrupt") is True:
-                    claude.interrupt()
-                elif (isinstance(request.get("message"), dict) and
-                      (active is None or not active.is_alive())):
-                    active = threading.Thread(
-                        target=complete, args=(request["message"],), daemon=True)
-                    active.start()
-                else:
-                    send({"error": "model generation already active"})
+            try:
+                initial = json.loads(reader.readline())
+                if not isinstance(initial, dict):
+                    return
+                system = initial.get("system")
+                if not isinstance(system, str):
+                    return
+                while line := reader.readline():
+                    request = json.loads(line)
+                    if not isinstance(request, dict):
+                        return
+                    if request.get("interrupt") is True:
+                        tinker.interrupt()
+                    elif (isinstance(request.get("message"), dict) and
+                          (active is None or not active.is_alive())):
+                        active = threading.Thread(
+                            target=complete, args=(request["message"],), daemon=True)
+                        active.start()
+                    else:
+                        send({"error": "model generation already active"})
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
     finally:
-        claude.interrupt()
+        tinker.interrupt()
         if active is not None:
             active.join(2)
-        claude.close()
+        tinker.close()
 
 
 class ModelServer:
-    def __init__(self, path: Path, cwd: Path, model: str, effort: str,
+    def __init__(self, path: Path, cwd: Path, model: str | None, effort: str | None,
                  session_id: str | None = None, resume: bool = False) -> None:
         self.path, self.cwd, self.model, self.effort = path, cwd, model, effort
         self.primary_session = (session_id, resume)
@@ -1081,7 +848,7 @@ def print_event(event: core.Event) -> None:
         print(f"! {event.value}", file=sys.stderr, flush=True)
 
 
-def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
+def run(cwd: Path, prompt: str | None, *, model: str | None, effort: str | None,
         feral: bool, name: str, headless: bool, sandbox: bool,
         world_socket: Path | None = None, session_id: str | None = None,
         resume: bool = False, context: int = 0,
@@ -1089,7 +856,11 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
-    ensure_auth()
+    if resume and model is None:
+        model = Tinker(cwd, session_id=session_id, resume=True).model
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+    ensure_tinker_auth()
     upstream_world = world_socket or os.environ.get("EKO_WORLD")
     with tempfile.TemporaryDirectory(prefix="eko-") as directory:
         runtime = Path(directory)
@@ -1119,13 +890,14 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             if headless:
                 agent.observer = print_event
                 print(f"EKO_SESSION={runtime / 'session.sock'}", flush=True)
+                print(f"EKO_MODEL_SESSION={session_id}", flush=True)
                 if prompt:
                     agent.send(prompt)
                 while agent.proc.poll() is None:
                     time.sleep(.2)
                 return
             ui = UI(context=context)
-            ui.header(cwd, model, name)
+            ui.header(cwd, model or DEFAULT_MODEL, name, session_id)
             ui.connect(agent)
             ui.on_exit = lambda: (agent.stop(), ui.exit())
             ui.on_start = lambda: agent.send(prompt) if prompt else None
@@ -1152,8 +924,11 @@ def main() -> None:
         "--cwd", type=Path,
         help="workspace (feral mode defaults to a fresh temporary directory)",
     )
-    parser.add_argument("--model", default="claude-opus-5")
-    parser.add_argument("--effort", default="high")
+    parser.add_argument(
+        "--model", help=f"base model or sampler checkpoint (default: {DEFAULT_MODEL})")
+    parser.add_argument(
+        "--effort", choices=tuple(EFFORT),
+        help="reasoning effort, when supported by the selected renderer")
     parser.add_argument("--name", default=core.NAME)
     parser.add_argument("--context", type=int, default=0)
     # Temporary experiment flag; remove after the workspace-hygiene evaluation.

@@ -9,8 +9,9 @@ terminal, model-provider, or sandbox dependency.
 
 An Eko process requires a host that provides a model conversation over the
 `EKO_MODEL` Unix socket. One connection to that socket is one independent model
-conversation. The included [`host.py`](host.py) supplies that service through the
-Claude Code CLI and adds the terminal interface, headless operation, authentication,
+conversation. The included [`host.py`](host.py) supplies that service through
+Tinker's native sampling API and adds the terminal interface, headless operation,
+authentication,
 and optional Bubblewrap sandbox.
 
 The whole agent is essentially:
@@ -100,7 +101,8 @@ with socket.socket(socket.AF_UNIX) as connection:
     connection.sendall((json.dumps(event) + "\n").encode())
 ```
 
-Content can include images by workspace-relative path:
+Content can include images by workspace-relative path when the selected model host
+supports them:
 
 ```json
 {"type":"input","content":[{"type":"image","path":"render.png"}]}
@@ -122,12 +124,18 @@ execution.
 
 ## Requirements and tests
 
-Eko requires Python 3.10 or newer. The included host requires the Claude Code CLI
-and a working Claude subscription; it prompts for authentication when necessary.
+The provider-neutral `eko.py` requires Python 3.10 or newer; the packaged Tinker
+host requires Python 3.11 or newer. Create a Tinker API key and expose it as
+`TINKER_API_KEY`. The default model is
+`thinkingmachines/Inkling-Small`; select another base model or sampler checkpoint
+with `--model`. Completed conversations are saved under
+`${XDG_STATE_HOME:-~/.local/state}/eko/sessions/` and can be continued with
+`--resume UUID`. The UUID appears in the interactive header and as
+`EKO_MODEL_SESSION` in headless mode.
 Sandboxing additionally requires Bubblewrap.
 
 Run the tests with:
 
 ```bash
-uv run --with prompt-toolkit --with rich python -m unittest -q test_eko.py
+uv run python -m unittest -q test_eko.py
 ```

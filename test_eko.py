@@ -17,9 +17,11 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import eko
 import host
+import tinker_model
 from rich.console import Console
 
 
@@ -154,16 +156,30 @@ class CoreTests(unittest.TestCase):
             eko.Input(eko.TERMINAL, (eko.Text("hello"),)),
             eko.Input(eko.PYTHON, (eko.Text("output"),), 1),
         ))
-        content = host._claude_content(message)
-        self.assertEqual(content, [
-            {"type": "text", "text": "[terminal]\n"},
-            {"type": "text", "text": "hello"},
-            {"type": "text", "text": "\n\n[python exit=1]\n"},
-            {"type": "text", "text": "output"},
-        ])
+        content = tinker_model._message(message)
+        self.assertEqual(content, {
+            "role": "user",
+            "content": "[terminal]\nhello\n\n[python exit=1]\noutput",
+        })
 
 
 class ModelSocketTests(unittest.TestCase):
+    def test_malformed_model_events_close_the_connection(self):
+        payloads = (
+            b"", b"\n", b"null\n", b"{}\n",
+            b'{"system":"test"}\ninvalid\n',
+            b'{"system":"test"}\n[]\n',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                server, client = socket.socketpair()
+                client.sendall(payload)
+                client.shutdown(socket.SHUT_WR)
+                model = FakeModel(lambda text, _cancelled: text)
+                with mock.patch.object(host, "Tinker", return_value=model):
+                    host._model_client(server, Path.cwd(), "fake", "low")
+                client.close()
+
     def test_model_connection_streams_and_returns_messages(self):
         with tempfile.TemporaryDirectory() as directory:
             endpoint = Path(directory) / "model.sock"
@@ -177,7 +193,7 @@ class ModelSocketTests(unittest.TestCase):
                 host._model_client(
                     connection, Path.cwd(), "fake", "low")
 
-            with mock.patch.object(host, "Claude", return_value=model):
+            with mock.patch.object(host, "Tinker", return_value=model):
                 thread = threading.Thread(target=serve, daemon=True)
                 thread.start()
                 remote = eko.Model(endpoint)
@@ -794,550 +810,113 @@ class RenderingTests(unittest.TestCase):
                          "<python_result>secret</python_result>Visible")
 
 
-class ModelTests(unittest.TestCase):
-    def test_agent_command_forwards_clean_workspace_flag(self):
-        command = host._agent_command(
-            Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,
-            name="Eko", clean_workspace=True,
-        )
+class TinkerModelTests(unittest.TestCase):
+    class Prompt:
+        def __init__(self, number):
+            self.number = number
 
-        self.assertIn("--clean-workspace", command)
+        def to_ints(self):
+            return list(range(self.number))
 
-    def test_agent_startup_error_includes_child_stderr(self):
-        agent = host.AgentProcess([
-            sys.executable, "-c",
-            "import sys; print('sandbox failed', file=sys.stderr); sys.exit(1)",
-        ])
-        self.assertTrue(agent.ready.wait(2))
-        agent.proc.wait(2)
-        self.assertEqual(agent.startup_error(),
-                         "agent did not start:\nsandbox failed")
-        agent.stop()
+    class Renderer:
+        def __init__(self):
+            self.calls = []
 
-    def test_agent_startup_error_includes_protocol_failure(self):
-        agent = host.AgentProcess([
-            sys.executable, "-c", "print('not-json', flush=True)",
-        ])
-        self.assertTrue(agent.ready.wait(2))
-        agent.proc.wait(2)
-        self.assertIn("Agent connection failed", agent.startup_error())
-        agent.stop()
+        def build_generation_prompt(self, messages, **options):
+            self.calls.append((messages, options))
+            return TinkerModelTests.Prompt(len(messages) * 10)
 
-    def test_host_accepts_new_and_resumed_primary_sessions(self):
-        session_id = "12345678-1234-5678-1234-567812345678"
-        for option, expected_resume in (
-            ("--session-id", False), ("--resume", True)
-        ):
-            with (
-                mock.patch.object(sys, "argv", ["eko", option, session_id]),
-                mock.patch.object(host, "run") as run,
-            ):
-                host.main()
-            self.assertEqual(run.call_args.kwargs["session_id"], session_id)
-            self.assertEqual(run.call_args.kwargs["resume"], expected_resume)
+        def get_stop_sequences(self):
+            return [123]
 
-    def test_model_server_assigns_persisted_session_only_to_primary(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            session_id = "12345678-1234-5678-1234-567812345678"
-            server = host.ModelServer(
-                root / "model.sock", root, "fake", "low", session_id, True
-            )
-            observed = []
+        def parse_response(self, tokens):
+            return tokens, "stop"
 
-            def model_client(connection, _cwd, _model, _effort,
-                             assigned=None, resume=False):
-                observed.append((assigned, resume))
-                connection.close()
+    class Client:
+        def __init__(self, *responses):
+            self.responses = list(responses)
 
-            with mock.patch.object(host, "_model_client", side_effect=model_client):
-                server.start()
-                for _ in range(2):
-                    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    client.connect(str(root / "model.sock"))
-                    client.close()
-                wait_until(lambda: len(observed) == 2)
-                server.close()
+        def get_base_model(self):
+            return "thinkingmachines/Inkling-Small"
 
-        self.assertCountEqual(observed, [(session_id, True), (None, False)])
+        def sample(self, _prompt, **_options):
+            value = self.responses.pop(0)
+            result = SimpleNamespace(sequences=[SimpleNamespace(tokens=value)])
+            return SimpleNamespace(result=lambda timeout=None: result)
 
-    def test_host_accepts_an_explicit_world_socket(self):
-        with (
-            mock.patch.object(
-                sys, "argv", ["eko", "--world-socket", "/tmp/world.sock"]
-            ),
-            mock.patch.object(host, "run") as run,
-        ):
-            host.main()
+    def setUp(self):
+        self.state = tempfile.TemporaryDirectory()
+        self.environment = mock.patch.dict(
+            os.environ, {"XDG_STATE_HOME": self.state.name})
+        self.environment.start()
 
-        self.assertEqual(run.call_args.kwargs["world_socket"], Path("/tmp/world.sock"))
+    def tearDown(self):
+        self.environment.stop()
+        self.state.cleanup()
 
-    def test_feral_host_defaults_to_an_empty_temporary_workspace(self):
-        observed = {}
+    def model(self, *responses, **options):
+        renderer = self.Renderer()
+        model = tinker_model.Tinker(
+            Path.cwd(), client=self.Client(*responses), renderer=renderer,
+            **options)
+        return model, renderer
 
-        def inspect_workspace(cwd, *_args, **_kwargs):
-            observed["cwd"] = cwd
-            observed["exists"] = cwd.is_dir()
-            observed["contents"] = list(cwd.iterdir())
-
-        with (
-            mock.patch.object(sys, "argv", ["eko", "--feral"]),
-            mock.patch.object(host, "run", side_effect=inspect_workspace),
-        ):
-            host.main()
-
-        self.assertTrue(observed["exists"])
-        self.assertEqual(observed["contents"], [])
-        self.assertFalse(observed["cwd"].exists())
-
-    def test_feral_host_preserves_an_explicit_workspace(self):
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            with (
-                mock.patch.object(
-                    sys, "argv", ["eko", "--feral", "--cwd", directory]
-                ),
-                mock.patch.object(host, "run") as run,
-            ):
-                host.main()
-
-        self.assertEqual(run.call_args.args[0], workspace)
-
-    def test_identity_is_configurable_and_location_is_neutral(self):
-        prompt = eko.SYSTEM.format(name="Moa", folder="/workspace", mode="")
-        self.assertTrue(prompt.startswith("You are Moa.\nYou are in /workspace.\n"))
-        self.assertEqual(eko.NAME, "Eko")
-        model = host.Claude(Path("/host/private"), "fake", "low")
-        self.assertEqual(model.cwd, Path("/host/private"))
-
-    def test_host_launches_the_provider_neutral_core(self):
-        with tempfile.TemporaryDirectory() as directory:
-            command = host._agent_command(
-                Path.cwd(), Path(directory), sandbox=False,
-                feral=False, name="Moa")
-
-        self.assertEqual(Path(command[1]).resolve(), Path(eko.__file__).resolve())
-        self.assertIn("--model-socket", command)
-        self.assertIn("--session-socket", command)
-
-    def test_sandbox_exposes_default_world_socket_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            command = host._agent_command(
-                Path.cwd(), Path(directory), sandbox=True,
-                feral=False, name="Moa")
-
-        index = command.index("EKO_WORLD")
-        self.assertEqual(command[index - 1], "--setenv")
-        self.assertEqual(command[index + 1], "/run/eko/world.sock")
-
-    def test_sandbox_executes_resolved_interpreter_not_relocated_symlink(self):
-        with tempfile.TemporaryDirectory() as directory:
-            command = host._agent_command(
-                Path.cwd(), Path(directory), sandbox=True,
-                feral=False, name="Moa")
-
-        source_index = len(command) - 1 - command[::-1].index("/run/eko.py")
-        self.assertEqual(command[source_index - 1], str(Path(sys.executable).resolve()))
-        self.assertNotIn("/opt/eko/bin/python", command)
-        pythonpath = command.index("PYTHONPATH")
-        self.assertEqual(command[pythonpath - 1], "--setenv")
-        self.assertTrue(command[pythonpath + 1].startswith("/opt/eko/"))
-
-    def test_world_relay_forwards_stream_without_interpreting_it(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            upstream_path = root / "upstream.sock"
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            listener.bind(str(upstream_path))
-            listener.listen()
-
-            def echo():
-                connection, _ = listener.accept()
-                with connection:
-                    while data := connection.recv(65536):
-                        connection.sendall(data)
-
-            server = threading.Thread(target=echo)
-            server.start()
-            relay = host.WorldRelay(root / "world.sock", upstream_path)
-            relay.start()
-            try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                    client.connect(str(root / "world.sock"))
-                    request = b'{"jsonrpc":"2.0","id":1,"method":"rpc.discover"}\n'
-                    client.sendall(request)
-                    self.assertEqual(client.recv(len(request)), request)
-            finally:
-                relay.close()
-                listener.close()
-                server.join(2)
-            self.assertFalse((root / "world.sock").exists())
-
-    @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
-    def test_sandbox_shutdown_removes_socket_and_detached_descendants(self):
-        """Namespace teardown must not leave a live daemon or session socket."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            workspace = root / "workspace"
-            runtime = root / "runtime"
-            workspace.mkdir()
-            runtime.mkdir()
-            endpoint = runtime / "model.sock"
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            listener.bind(str(endpoint))
-            listener.listen()
-
-            code = '''\
-import os, subprocess, sys, time
-graceful = """import pathlib, signal, sys, time
-def stop(_signal, _frame):
-    pathlib.Path('/workspace/terminated').write_text('graceful')
-    sys.exit(0)
-signal.signal(signal.SIGTERM, stop)
-pathlib.Path('/workspace/graceful-ready').touch()  # GRACEFUL_READY
-time.sleep(300)
-"""
-stubborn = """import pathlib, signal, time
-signal.signal(signal.SIGTERM, signal.SIG_IGN)
-pathlib.Path('/workspace/stubborn-ready').touch()
-time.sleep(300)  # STUBBORN_DAEMON
-"""
-double_fork = """import subprocess, sys
-child = ("import pathlib, signal, time; "
-         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-         "pathlib.Path('/workspace/double-ready').touch(); "
-         "time.sleep(300)  # DOUBLE_FORK_DAEMON")
-subprocess.Popen([sys.executable, '-c', child], start_new_session=True,
-                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                 stderr=subprocess.DEVNULL)
-"""
-processes = [
-    subprocess.Popen([sys.executable, "-c", graceful], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL),
-    subprocess.Popen([sys.executable, "-c", stubborn], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL),
-    subprocess.Popen([sys.executable, "-c", double_fork], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL),
-]
-
-child_env = {key: value for key, value in os.environ.items()
-             if key != 'EKO_SESSION'}
-child_input, child_hold = os.pipe()
-processes.append(subprocess.Popen(
-    [sys.executable, os.environ['EKO_AGENT'], '--cwd', '/workspace',
-     '--name', 'CLEANUP_CHILD', '--session-socket', '/tmp/cleanup-child.sock'],
-    start_new_session=True, stdin=child_input, stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL, env=child_env, pass_fds=(child_hold,)))
-os.close(child_input)
-os.close(child_hold)
-
-nested = """import pathlib, signal, time
-signal.signal(signal.SIGTERM, signal.SIG_IGN)
-pathlib.Path('/workspace/nested-ready').touch()
-time.sleep(300)  # NESTED_SANDBOX_DAEMON
-"""
-processes.append(subprocess.Popen([
-    'bwrap', '--new-session', '--as-pid-1', '--unshare-user', '--unshare-pid',
-    '--ro-bind', '/', '/', '--bind', '/workspace', '/workspace',
-    '--proc', '/proc', '/usr/bin/python3', '-c', nested],
-    start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL))
-
-deadline = time.monotonic() + 5
-while not os.path.exists('/tmp/cleanup-child.sock') and time.monotonic() < deadline:
-    time.sleep(.02)
-if os.path.exists('/tmp/cleanup-child.sock'):
-    open('/workspace/child-ready', 'w').close()
-print("DAEMONS", *(process.pid for process in processes))
-'''
-
-            stopping = threading.Event()
-            clients = []
-
-            def model_client(connection):
-                with connection, connection.makefile("rb") as reader:
-                    json.loads(reader.readline())  # system prompt
-                    line = reader.readline()
-                    if not line:  # An idle child agent.
-                        return
-                    json.loads(line)  # terminal input
-                    response = eko.Message(
-                        "assistant", (eko.Text(f"```python-run\n{code}```"),))
-                    connection.sendall((json.dumps({
-                        "message": eko.encode_message(response),
-                    }) + "\n").encode())
-                    json.loads(reader.readline())  # Python result
-                    response = eko.Message("assistant", (eko.Text("<done/>"),))
-                    connection.sendall((json.dumps({
-                        "message": eko.encode_message(response),
-                    }) + "\n").encode())
-                    reader.readline()
-
-            def model_service():
-                listener.settimeout(.1)
-                while not stopping.is_set():
-                    try:
-                        connection, _ = listener.accept()
-                    except socket.timeout:
-                        continue
-                    except OSError:
-                        return
-                    client = threading.Thread(
-                        target=model_client, args=(connection,))
-                    client.start()
-                    clients.append(client)
-
-            server = threading.Thread(target=model_service)
-            server.start()
-            agent = host.AgentProcess(host._agent_command(
-                workspace, runtime, sandbox=True, feral=False, name="Eko"))
-            events = []
-            agent.observer = events.append
-            try:
-                self.assertTrue(agent.ready.wait(10))
-                self.assertIsNone(agent.proc.poll())
-                agent.send("start a detached process")
-                wait_until(lambda: any(event.type == "result" for event in events),
-                           timeout=10)
-                result = next(event.value for event in events
-                              if event.type == "result")
-                ready = ("graceful-ready", "stubborn-ready", "double-ready",
-                         "child-ready", "nested-ready")
-                deadline = time.monotonic() + 10
-                while (not all((workspace / name).exists() for name in ready)
-                       and time.monotonic() < deadline):
-                    time.sleep(.02)
-                missing = [name for name in ready
-                           if not (workspace / name).exists()]
-                self.assertEqual(missing, [], result.output)
-
-                def descendants(pid):
-                    found = []
-                    pending = [pid]
-                    while pending:
-                        parent = pending.pop()
-                        path = Path(f"/proc/{parent}/task/{parent}/children")
-                        try:
-                            children = [int(item) for item in path.read_text().split()]
-                        except OSError:
-                            children = []
-                        found.extend(children)
-                        pending.extend(children)
-                    return found
-
-                descendants_before_stop = descendants(agent.proc.pid)
-                commands = b"\n".join(
-                    Path(f"/proc/{pid}/cmdline").read_bytes()
-                    for pid in descendants_before_stop
-                    if Path(f"/proc/{pid}/cmdline").exists())
-                for marker in (b"GRACEFUL_READY", b"STUBBORN_DAEMON",
-                               b"DOUBLE_FORK_DAEMON", b"CLEANUP_CHILD",
-                               b"NESTED_SANDBOX_DAEMON"):
-                    self.assertIn(marker, commands)
-                self.assertTrue((runtime / "session.sock").exists())
-
-                agent.stop()
-
-                wait_until(lambda: all(not Path(f"/proc/{pid}").exists()
-                                       for pid in descendants_before_stop),
-                           timeout=5)
-                self.assertEqual((workspace / "terminated").read_text(),
-                                 "graceful")
-                self.assertFalse((runtime / "session.sock").exists())
-                self.assertEqual(agent.proc.returncode, 0)
-            finally:
-                agent.stop()
-                stopping.set()
-                listener.close()
-                server.join(5)
-                for client in clients:
-                    client.join(5)
-
-    def test_close_tolerates_concurrent_interrupt_clearing_process(self):
-        model = host.Claude(Path.cwd(), "fake", "low")
-        stdout = io.BytesIO()
-
-        class Process:
-            def __init__(self):
-                self.stdin = None
-                self.stdout = stdout
-
-            def poll(self):
-                model.proc = None
-                return 0
-
-        model.proc = Process()
-        model.close()
-        self.assertTrue(stdout.closed)
-        self.assertIsNone(model.proc)
-
-    def test_exact_empty_text_resume_error_repairs_only_its_assistant_block(self):
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory) / "projects" / "project"
-            project.mkdir(parents=True)
-            model = host.Claude(Path.cwd(), "fake", "low")
-            model.started = True
-            agent = project / f"{model.session_id}.jsonl"
-            unchanged = '{"type":"user","message":{"content":[{"type":"text","text":""}]}}\n'
-            broken = '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""},{"type":"text","text":""}]}}\n'
-            agent.write_text(unchanged + broken)
-            failed = json.dumps({
-                "type": "result", "is_error": True,
-                "result": "API Error: 400 messages: text content blocks must be non-empty",
-            }) + "\n"
-            recovered = "".join(json.dumps(event) + "\n" for event in [
-                {"type": "assistant", "message": {"content": [
-                    {"type": "text", "text": "recovered"}]}},
-                {"type": "result", "is_error": False},
-            ])
-            starts = []
-
-            def start(_system):
-                payload = failed if not starts else recovered
-                starts.append(True)
-                script = ("import sys; sys.stdin.buffer.readline(); "
-                          f"sys.stdout.buffer.write({payload.encode()!r}); "
-                          "sys.stdout.buffer.flush()")
-                model.proc = subprocess.Popen(
-                    [sys.executable, "-c", script], stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
-
-            model._start = start
-            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": directory}):
-                reply = model.complete(eko.SYSTEM, conversation("continue")[0], lambda _: None)
-                self.assertEqual(eko.message_text(reply), "recovered")
-                model.close()
-
-            lines = agent.read_text().splitlines(keepends=True)
-            self.assertEqual(lines[0], unchanged)
-            content = json.loads(lines[1])["message"]["content"]
-            self.assertEqual(content[0]["thinking"], "")
-            self.assertEqual(content[1]["text"], " ")
-            self.assertEqual(len(starts), 2)
-
-    def test_failed_resume_can_recover_same_session(self):
-        model = host.Claude(Path.cwd(), "fake", "low")
-        model.started = True
-        session_id = model.session_id
-        failed = json.dumps({
-            "type": "result", "is_error": True,
-            "result": "temporarily unavailable",
-        }) + "\n"
-        recovered = "".join(json.dumps(event) + "\n" for event in [
-            {"type": "assistant", "message": {"content": [
-                {"type": "text", "text": "recovered"}]}},
-            {"type": "result", "is_error": False},
-        ])
-        starts = []
-
-        def start(_system):
-            payload = failed if not starts else recovered
-            starts.append(True)
-            script = (
-                "import sys; sys.stdin.buffer.readline(); "
-                f"sys.stdout.buffer.write({payload.encode()!r}); "
-                "sys.stdout.buffer.flush()")
-            model.proc = subprocess.Popen(
-                [sys.executable, "-c", script], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
-            model.started = True
-
-        model._start = start
-        reply = model.complete(eko.SYSTEM, conversation("continue")[0], lambda _: None)
-        self.assertEqual(eko.message_text(reply), "recovered")
-        self.assertEqual(len(starts), 2)
-        self.assertEqual(model.session_id, session_id)
-        model.close()
-
-    def test_failed_resume_retries_without_resetting_session(self):
-        model = host.Claude(Path.cwd(), "fake", "low")
-        model.started = True
-        session_id = model.session_id
-        event = json.dumps({
-            "type": "result", "is_error": True,
-            "result": "agent unavailable",
-        }) + "\n"
-        script = (
-            "import sys; sys.stdin.buffer.readline(); "
-            f"sys.stdout.buffer.write({event.encode()!r}); "
-            "sys.stdout.buffer.flush()")
-        starts = []
-
-        def start(_system):
-            starts.append(True)
-            model.proc = subprocess.Popen(
-                [sys.executable, "-c", script], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
-            model.started = True
-
-        model._start = start
-        with mock.patch.object(host, "CALL_TIMEOUT", .5):
-            with self.assertRaisesRegex(RuntimeError, "context was not reset"):
-                model.complete(eko.SYSTEM, conversation("orphaned output")[0], lambda _: None)
-        self.assertGreaterEqual(len(starts), 2)
-        self.assertTrue(model.started)
-        self.assertEqual(model.session_id, session_id)
-
-    def test_multiple_events_buffered_in_one_write_do_not_stall(self):
-        model = host.Claude(Path.cwd(), "fake", "low")
-        events = [
-            {"type": "stream_event", "event": {
-                "type": "content_block_delta",
-                "delta": {"type": "text_delta", "text": "hello"}}},
-            {"type": "assistant", "message": {
-                "content": [{"type": "text", "text": "hello"}]}},
-            {"type": "result", "is_error": False},
-        ]
-        payload = "".join(json.dumps(event) + "\n"
-                          for event in events)
-        script = (
-            "import sys; sys.stdin.buffer.readline(); "
-            f"sys.stdout.buffer.write({payload.encode()!r}); "
-            "sys.stdout.buffer.flush()")
-
-        def start(_system):
-            model.proc = subprocess.Popen(
-                [sys.executable, "-c", script], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
-            model.started = True
-
-        model._start = start
+    def test_turns_preserve_full_cookbook_state_and_context_usage(self):
+        response = {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "private"},
+            {"type": "text", "text": "answer"},
+        ]}
+        model, renderer = self.model(response, model="fake", effort="high")
         streamed = []
-        reply = model.complete(eko.SYSTEM, conversation("hi")[0], streamed.append)
-        self.assertEqual(eko.message_text(reply), "hello")
-        self.assertEqual(streamed, ["hello"])
-        model.close()
+        reply = model.complete(eko.SYSTEM, conversation("hello")[0], streamed.append)
 
-    def test_interrupt_does_not_race_with_stdout_reader(self):
-        model = host.Claude(Path.cwd(), "fake", "low")
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(10)"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, start_new_session=True)
-        model.proc = proc
-        model.started = True
-        errors = []
+        self.assertEqual(eko.message_text(reply), "answer")
+        self.assertEqual(streamed, ["answer"])
+        self.assertEqual(model.messages[-1], response)
+        self.assertEqual(model.context_used, 20)
+        self.assertEqual(renderer.calls[0][1], {"effort": .9})
+        state = json.loads(model.state_file.read_text())
+        self.assertEqual(state["messages"], model.messages)
+        self.assertEqual(state["version"], tinker_model.SESSION_VERSION)
+        self.assertEqual(model.state_file.stat().st_mode & 0o777, 0o600)
 
-        def complete():
-            try:
-                model.complete(eko.SYSTEM, conversation("hello")[0], lambda text: None)
-            except BaseException as error:
-                errors.append(error)
+    def test_saved_session_resumes(self):
+        original, _ = self.model(
+            {"role": "assistant", "content": "first"}, model="fake")
+        original.complete(eko.SYSTEM, conversation("one")[0], lambda _: None)
+        resumed = tinker_model.Tinker(
+            Path.cwd(), "fake", session_id=original.session_id, resume=True,
+            client=self.Client({"role": "assistant", "content": "second"}),
+            renderer=self.Renderer())
 
-        thread = threading.Thread(target=complete)
-        thread.start()
-        time.sleep(.05)
-        model.interrupt()
-        thread.join(2)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], InterruptedError)
-        assert proc.stdin and proc.stdout
-        proc.stdin.close()
-        proc.stdout.close()
+        reply = resumed.complete(eko.SYSTEM, conversation("two")[0], lambda _: None)
+
+        self.assertEqual(eko.message_text(reply), "second")
+        self.assertEqual(resumed.messages[-4], {"role": "user", "content": "one"})
+
+    def test_resume_rejects_changed_context(self):
+        original, _ = self.model(
+            {"role": "assistant", "content": "first"}, model="fake")
+        original.complete(eko.SYSTEM, conversation("one")[0], lambda _: None)
+        resumed = tinker_model.Tinker(
+            Path.cwd(), "fake", session_id=original.session_id, resume=True,
+            client=self.Client(), renderer=self.Renderer())
+
+        with self.assertRaisesRegex(ValueError, "system context"):
+            resumed.complete("different", conversation("two")[0], lambda _: None)
+
+    def test_image_input_fails_explicitly(self):
+        model, _ = self.model(model="fake")
+        message = eko.Message("user", (eko.Image("image/png", b"image"),))
+        with self.assertRaisesRegex(ValueError, "does not support image"):
+            model.complete(eko.SYSTEM, message, lambda _: None)
+
+    def test_auth_requires_tinker_key(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(SystemExit, "TINKER_API_KEY"):
+                tinker_model.ensure_auth()
+        with mock.patch.dict(os.environ, {"TINKER_API_KEY": "secret"}):
+            tinker_model.ensure_auth()
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux is required")
