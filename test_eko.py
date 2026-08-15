@@ -1081,6 +1081,35 @@ class ModelTests(unittest.TestCase):
 
         self.assertCountEqual(observed, [(session_id, True), (None, False)])
 
+    def test_model_server_passes_injected_tinker_rollout_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client_object = object()
+            trajectory = root / "trajectory.jsonl"
+            state = root / "state"
+            server = host.ModelServer(
+                root / "model.sock", root / "workspace", "model", "high",
+                tinker_client=client_object, trajectory_path=trajectory,
+                state_root=state)
+            observed = []
+
+            def model_client(connection, *_args, **kwargs):
+                observed.append(kwargs)
+                connection.close()
+
+            with mock.patch.object(host, "_model_client", side_effect=model_client):
+                server.start()
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.connect(str(root / "model.sock")); client.close()
+                wait_until(lambda: len(observed) == 1)
+                server.close()
+
+        self.assertEqual(observed, [{
+            "tinker_client": client_object,
+            "trajectory_path": trajectory,
+            "state_root": state,
+        }])
+
     def test_host_accepts_an_explicit_world_socket(self):
         with (
             mock.patch.object(
@@ -1091,6 +1120,18 @@ class ModelTests(unittest.TestCase):
             host.main()
 
         self.assertEqual(run.call_args.kwargs["world_socket"], Path("/tmp/world.sock"))
+
+    def test_host_accepts_an_upstream_model_socket(self):
+        with (
+            mock.patch.object(
+                sys, "argv", ["eko", "--upstream-model-socket", "/tmp/model.sock"]
+            ),
+            mock.patch.object(host, "run") as run,
+        ):
+            host.main()
+
+        self.assertEqual(run.call_args.kwargs["upstream_model_socket"],
+                         Path("/tmp/model.sock"))
 
     def test_feral_host_defaults_to_an_empty_temporary_workspace(self):
         observed = {}

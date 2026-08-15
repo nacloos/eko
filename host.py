@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import eko as core
 from models import (Claude, Tinker, _claude_content, ensure_claude_auth,
@@ -490,7 +490,9 @@ class AgentProcess:
 
 def _model_client(connection: socket.socket, cwd: Path,
                   model: str, effort: str | None, session_id: str | None = None,
-                  resume: bool = False) -> None:
+                  resume: bool = False, tinker_client: Any = None,
+                  trajectory_path: Path | None = None,
+                  state_root: Path | None = None) -> None:
     """Give one agent connection the conversation requested in its handshake."""
     conversation = None
     lock = threading.Lock()
@@ -553,13 +555,21 @@ def _model_client(connection: socket.socket, cwd: Path,
                         or isinstance(max_turns, bool)
                         or max_turns < 0):
                     return
-                conversation = (
-                    Claude(cwd, requested_model, requested_effort or "high",
-                           requested_session, requested_resume)
-                    if requested_model.startswith("claude-") else
-                    Tinker(cwd, requested_model, requested_effort,
-                           requested_session, requested_resume)
-                )
+                if requested_model.startswith("claude-"):
+                    conversation = Claude(
+                        cwd, requested_model, requested_effort or "high",
+                        requested_session, requested_resume)
+                else:
+                    options = {}
+                    if tinker_client is not None:
+                        options["client"] = tinker_client
+                    if trajectory_path is not None:
+                        options["trajectory_path"] = trajectory_path
+                    if state_root is not None:
+                        options["state_root"] = state_root
+                    conversation = Tinker(
+                        cwd, requested_model, requested_effort,
+                        requested_session, requested_resume, **options)
                 while line := reader.readline():
                     request = json.loads(line)
                     if not isinstance(request, dict):
@@ -599,9 +609,15 @@ def _model_client(connection: socket.socket, cwd: Path,
 
 class ModelServer:
     def __init__(self, path: Path, cwd: Path, model: str, effort: str,
-                 session_id: str | None = None, resume: bool = False) -> None:
+                 session_id: str | None = None, resume: bool = False,
+                 tinker_client: Any = None,
+                 trajectory_path: Path | None = None,
+                 state_root: Path | None = None) -> None:
         self.path, self.cwd, self.model, self.effort = path, cwd, model, effort
         self.primary_session = (session_id, resume)
+        self.tinker_client = tinker_client
+        self.trajectory_path = trajectory_path
+        self.state_root = state_root
         self.session_lock = threading.Lock()
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(path))
@@ -625,10 +641,17 @@ class ModelServer:
             with self.session_lock:
                 session_id, resume = self.primary_session
                 self.primary_session = (None, False)
+            options = {}
+            if self.tinker_client is not None:
+                options["tinker_client"] = self.tinker_client
+            if self.trajectory_path is not None:
+                options["trajectory_path"] = self.trajectory_path
+            if self.state_root is not None:
+                options["state_root"] = self.state_root
             thread = threading.Thread(
                 target=_model_client,
                 args=(connection, self.cwd, self.model, self.effort,
-                      session_id, resume), daemon=True)
+                      session_id, resume), kwargs=options, daemon=True)
             thread.start()
             self.clients.append(thread)
 
@@ -864,19 +887,25 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         resume: bool = False, context: int = 0,
         clean_workspace: bool = False,
         python_timeout: float = core.PYTHON_TIMEOUT,
-        max_turns: int = 0, exit_when_idle: bool = False) -> None:
+        max_turns: int = 0, exit_when_idle: bool = False,
+        upstream_model_socket: Path | None = None) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
-    (ensure_claude_auth() if model.startswith("claude-")
-     else ensure_tinker_auth())
+    if upstream_model_socket is None:
+        (ensure_claude_auth() if model.startswith("claude-")
+         else ensure_tinker_auth())
     upstream_world = world_socket or os.environ.get("EKO_WORLD")
     with tempfile.TemporaryDirectory(prefix="eko-") as directory:
         runtime = Path(directory)
-        server = ModelServer(
-            runtime / "model.sock", cwd, model, effort, session_id, resume
-        )
-        server.start()
+        server = (None if upstream_model_socket is not None else ModelServer(
+            runtime / "model.sock", cwd, model, effort, session_id, resume))
+        model_relay = (WorldRelay(runtime / "model.sock", upstream_model_socket)
+                       if upstream_model_socket is not None else None)
+        if server is not None:
+            server.start()
+        if model_relay is not None:
+            model_relay.start()
         relay = (
             WorldRelay(runtime / "world.sock", Path(upstream_world))
             if upstream_world
@@ -927,7 +956,10 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             agent.stop()
             if relay is not None:
                 relay.close()
-            server.close()
+            if model_relay is not None:
+                model_relay.close()
+            if server is not None:
+                server.close()
 
 
 def main() -> None:
@@ -965,6 +997,10 @@ def main() -> None:
         "--world-socket", type=Path,
         help="connect the agent to an external world socket",
     )
+    parser.add_argument(
+        "--upstream-model-socket", type=Path,
+        help="relay model requests to an existing host-side model service",
+    )
     session = parser.add_mutually_exclusive_group()
     session.add_argument(
         "--session-id", help="UUID to use for a new primary conversation"
@@ -988,7 +1024,8 @@ def main() -> None:
             resume=args.resume is not None, context=args.context,
             clean_workspace=args.clean_workspace,
             python_timeout=args.python_timeout, max_turns=args.max_turns,
-            exit_when_idle=args.exit_when_idle)
+            exit_when_idle=args.exit_when_idle,
+            upstream_model_socket=args.upstream_model_socket)
 
     try:
         if args.feral and args.cwd is None:

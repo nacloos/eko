@@ -93,8 +93,8 @@ def mcp_tool_content(result: core.Result) -> list[dict]:
     return content
 
 
-def session_file(session_id: str) -> Path:
-    root = Path(os.environ.get(
+def session_file(session_id: str, state_root: Path | None = None) -> Path:
+    root = state_root or Path(os.environ.get(
         "XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return root / "eko" / "sessions" / f"{session_id}.json"
 
@@ -115,7 +115,8 @@ class Tinker:
                  effort: str | None = None, session_id: str | None = None,
                  resume: bool = False, client: Any = None,
                  renderer: Any = None,
-                 trajectory_path: Path | None = None) -> None:
+                 trajectory_path: Path | None = None,
+                 state_root: Path | None = None) -> None:
         self.cwd = cwd
         self.model = model or DEFAULT_MODEL
         self.effort = effort
@@ -124,7 +125,7 @@ class Tinker:
                                else str(uuid.uuid4()))
         except ValueError as error:
             raise ValueError(f"invalid session ID: {session_id}") from error
-        self.state_file = session_file(self.session_id)
+        self.state_file = session_file(self.session_id, state_root)
         self.client = client
         self.renderer = renderer
         self.base_model: str | None = None
