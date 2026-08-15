@@ -110,6 +110,12 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(agent.python_timeout, 30)
 
     def test_system_distinguishes_user_steering_from_async_observations(self):
+        self.assertIn(
+            "Express your reasoning in ordinary assistant text throughout the task.",
+            eko.SYSTEM)
+        self.assertIn("what you learned from prior results", eko.SYSTEM)
+        self.assertIn("what you currently believe", eko.SYSTEM)
+        self.assertIn("why the next action will help", eko.SYSTEM)
         self.assertIn('Source "user-terminal" is a controlling user', eko.SYSTEM)
         self.assertIn('before continuing the current plan', eko.SYSTEM)
         self.assertIn('Process and harness inputs are observations', eko.SYSTEM)
@@ -877,6 +883,24 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_claude_process_exit_clears_python_broker_handler(self):
+        model = host.Claude(Path.cwd(), "fake", "low")
+
+        def start(_system):
+            model.proc = subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.stdin.buffer.readline()"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, bufsize=0)
+            model.started = True
+
+        model._start = start
+        with self.assertRaisesRegex(
+                RuntimeError, "Model process exited without a result"):
+            model.complete(eko.SYSTEM, conversation("stop")[0], lambda _: None)
+        with model.broker.lock:
+            self.assertIsNone(model.broker.handler)
+        model.close()
+
     def test_claude_max_turn_boundary_flushes_process_before_returning(self):
         model = host.Claude(Path.cwd(), "fake", "low")
         payload = json.dumps({
@@ -1474,10 +1498,9 @@ print("DAEMONS", *(process.pid for process in processes))
             model.started = True
 
         model._start = start
-        with mock.patch.object(models, "CALL_TIMEOUT", .5):
-            with self.assertRaisesRegex(RuntimeError, "context was not reset"):
-                model.complete(eko.SYSTEM, conversation("orphaned output")[0], lambda _: None)
-        self.assertGreaterEqual(len(starts), 2)
+        with self.assertRaisesRegex(RuntimeError, "context was not reset"):
+            model.complete(eko.SYSTEM, conversation("orphaned output")[0], lambda _: None)
+        self.assertEqual(len(starts), models.RESUME_RETRIES + 1)
         self.assertTrue(model.started)
         self.assertEqual(model.session_id, session_id)
 

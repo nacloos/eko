@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-import select
 import shutil
 import signal
 import socket
@@ -13,7 +12,6 @@ import os
 import sys
 import tempfile
 import threading
-import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
@@ -21,8 +19,8 @@ from typing import Any, Callable
 
 import eko as core
 
-CALL_TIMEOUT = 300
 MAX_TOKENS = 8192
+RESUME_RETRIES = 3
 DEFAULT_MODEL = "thinkingmachines/Inkling-Small"
 SESSION_VERSION = 3
 EFFORT = {"low": .2, "medium": .7, "high": .9, "xhigh": .99, "max": .99}
@@ -240,18 +238,14 @@ class Tinker:
                 prompt, num_samples=1,
                 sampling_params=tinker.SamplingParams(
                     max_tokens=MAX_TOKENS, stop=renderer.get_stop_sequences()))
-            deadline = time.monotonic() + CALL_TIMEOUT
             while True:
                 if self.interrupted.is_set():
                     raise InterruptedError
                 try:
-                    remaining = max(0, deadline - time.monotonic())
-                    response = future.result(timeout=min(.1, remaining))
+                    response = future.result(timeout=.1)
                     break
                 except FutureTimeout:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"model response timed out after {CALL_TIMEOUT}s")
+                    continue
             parsed, _termination = renderer.parse_response(
                 response.sequences[0].tokens)
             assistant = dict(parsed)
@@ -558,7 +552,8 @@ class Claude:
             except (BrokenPipeError, subprocess.TimeoutExpired):
                 self._terminate(signal.SIGTERM)
                 return
-        for stream in (getattr(proc, "stdout", None),
+        for stream in (getattr(proc, "stdin", None),
+                       getattr(proc, "stdout", None),
                        getattr(proc, "stderr", None)):
             if stream is not None and not stream.closed:
                 stream.close()
@@ -568,14 +563,13 @@ class Claude:
     def complete(self, system: str, message: core.Message,
                  on_text: Callable[[str], None],
                  on_python: Callable[[str], core.Result] | None = None,
-                 deadline: float | None = None,
                  retry_delay: float = .2,
+                 retries: int = 0,
                  max_turns: int = 0) -> core.Message:
         """Complete a history using the CLI's internally persisted conversation."""
         if message.role != "user":
             raise ValueError("model input must be a user message")
         self.interrupted.clear()
-        deadline = deadline or time.monotonic() + CALL_TIMEOUT
         resuming = self.started
         if self.proc is None or self.proc.poll() is not None:
             if max_turns:
@@ -592,78 +586,72 @@ class Claude:
 
         parts: list[str] = []
         complete = ""
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [proc.stdout], [], [], max(0, deadline - time.monotonic()))
-            if not ready:
-                break
-            line = proc.stdout.readline()
-            if not line:
-                if self.interrupted.is_set():
-                    raise InterruptedError
-                break
-            if not line.startswith(b"{"):
-                continue
-            data = json.loads(line)
-            if data.get("type") == "stream_event":
-                event = data.get("event", {})
-                delta = event.get("delta", {})
-                if (event.get("type") == "content_block_delta"
-                        and delta.get("type") == "text_delta"):
-                    text = delta.get("text", "")
-                    parts.append(text)
-                    on_text(text)
-            elif data.get("type") == "assistant":
-                complete = "".join(
-                    block["text"] for block in data["message"].get("content", [])
-                    if block.get("type") == "text")
-            elif data.get("type") == "result":
-                with self.broker.lock:
-                    self.broker.handler = None
-                if data.get("subtype") == "error_max_turns" and max_turns:
+        try:
+            while line := proc.stdout.readline():
+                if not line.startswith(b"{"):
+                    continue
+                data = json.loads(line)
+                if data.get("type") == "stream_event":
+                    event = data.get("event", {})
+                    delta = event.get("delta", {})
+                    if (event.get("type") == "content_block_delta"
+                            and delta.get("type") == "text_delta"):
+                        text = delta.get("text", "")
+                        parts.append(text)
+                        on_text(text)
+                elif data.get("type") == "assistant":
+                    complete = "".join(
+                        block["text"] for block in data["message"].get("content", [])
+                        if block.get("type") == "text")
+                elif data.get("type") == "result":
+                    if data.get("subtype") == "error_max_turns" and max_turns:
+                        usage = data.get("usage") or {}
+                        self.context_used = (int(usage["prompt_tokens"])
+                                             if usage.get("prompt_tokens") is not None
+                                             else sum(int(usage.get(name) or 0)
+                                                      for name in (
+                                                          "input_tokens",
+                                                          "cache_read_input_tokens",
+                                                          "cache_creation_input_tokens")))
+                        self._finish()
+                        return core.Message("assistant", ())
+                    if data.get("is_error"):
+                        detail = data.get("result") or data.get("error")
+                        if resuming:
+                            self._terminate(signal.SIGTERM)
+                            proc.stdin.close()
+                            proc.stdout.close()
+                            if ("text content blocks must be non-empty" in str(detail)
+                                    and self._repair_session()):
+                                return self.complete(
+                                    system, message, on_text, on_python,
+                                    retry_delay, retries, max_turns)
+                            if (retries < RESUME_RETRIES
+                                    and not parts and not complete):
+                                if self.interrupted.wait(retry_delay):
+                                    raise InterruptedError
+                                return self.complete(
+                                    system, message, on_text, on_python,
+                                    min(retry_delay * 2, 5), retries + 1,
+                                    max_turns)
+                            raise RuntimeError(
+                                "Model session could not resume; context was not "
+                                f"reset. {detail or ''}".rstrip())
+                        raise RuntimeError(detail or "Model call failed")
                     usage = data.get("usage") or {}
                     self.context_used = (int(usage["prompt_tokens"])
-                                         if usage.get("prompt_tokens") is not None
-                                         else sum(int(usage.get(name) or 0)
-                                                  for name in (
-                                                      "input_tokens",
-                                                      "cache_read_input_tokens",
-                                                      "cache_creation_input_tokens")))
-                    self._finish()
-                    return core.Message("assistant", ())
-                if data.get("is_error"):
-                    detail = data.get("result") or data.get("error")
-                    if resuming:
-                        self._terminate(signal.SIGTERM)
-                        proc.stdin.close()
-                        proc.stdout.close()
-                        if ("text content blocks must be non-empty" in str(detail)
-                                and self._repair_session()):
-                            return self.complete(
-                                system, message, on_text, on_python,
-                                deadline, retry_delay, max_turns)
-                        remaining = deadline - time.monotonic()
-                        if remaining > 0 and not parts and not complete:
-                            delay = min(retry_delay, remaining)
-                            if self.interrupted.wait(delay):
-                                raise InterruptedError
-                            if time.monotonic() < deadline:
-                                return self.complete(
-                                    system, message, on_text, on_python, deadline,
-                                    min(retry_delay * 2, 5), max_turns)
-                        raise RuntimeError(
-                            "Model session could not resume; context was not "
-                            f"reset. {detail or ''}".rstrip())
-                    raise RuntimeError(detail or "Model call failed")
-                usage = data.get("usage") or {}
-                self.context_used = (int(usage["prompt_tokens"])
-                                     if usage.get("prompt_tokens") is not None else
-                                     sum(int(usage.get(name) or 0) for name in (
-                                         "input_tokens", "cache_read_input_tokens",
-                                         "cache_creation_input_tokens")))
-                return core.Message(
-                    "assistant", (core.Text(complete or "".join(parts)),))
-        raise RuntimeError("Model produced no result")
+                                         if usage.get("prompt_tokens") is not None else
+                                         sum(int(usage.get(name) or 0) for name in (
+                                             "input_tokens", "cache_read_input_tokens",
+                                             "cache_creation_input_tokens")))
+                    return core.Message(
+                        "assistant", (core.Text(complete or "".join(parts)),))
+        finally:
+            with self.broker.lock:
+                self.broker.handler = None
+        if self.interrupted.is_set():
+            raise InterruptedError
+        raise RuntimeError("Model process exited without a result")
 
     def close(self) -> None:
         """Give the CLI a brief chance to flush its session, then stop it."""

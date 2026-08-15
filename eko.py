@@ -51,6 +51,11 @@ NAME = "Eko"
 SYSTEM = """You are {name}.
 You are in {folder}.
 
+Express your reasoning in ordinary assistant text throughout the task. Before each
+tool call, explain what you learned from prior results, what you currently believe,
+and why the next action will help. Include enough detail to make the reasoning
+understandable and useful on its own.
+
 Use the python tool to act. It runs in that folder and returns its combined output,
 marking nonzero exits as errors.
 

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Callable
 
 import eko as core
-from models import (CALL_TIMEOUT, Claude, Tinker, _claude_content, ensure_claude_auth,
+from models import (Claude, Tinker, _claude_content, ensure_claude_auth,
                     ensure_tinker_auth)
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
@@ -512,7 +512,7 @@ def _model_client(connection: socket.socket, cwd: Path,
             tool_results[call_id] = result
             send({"tool_call": {"id": call_id, "code": code}})
             try:
-                return result.get(timeout=CALL_TIMEOUT)
+                return result.get()
             finally:
                 tool_results.pop(call_id, None)
 
