@@ -47,6 +47,18 @@ uv run --script host.py --headless --cwd ~/projects/my-project "Fix the tests"
 uv run --script host.py --sandbox --cwd ~/projects/my-project
 ```
 
+Additional host files or directories use the standard Docker/Podman mount
+syntax. The source must exist and the target must be inside `/workspace`;
+repeat `--mount` as needed:
+
+```bash
+eko --sandbox --cwd workspace \
+  --mount type=bind,source=/path/to/data,target=/workspace/data,readonly
+```
+
+Use `readonly` (or `ro`) for evidence and datasets the agent must not modify.
+As in Docker and Podman, a bind mount is writable when that option is omitted.
+
 Python actions time out after 30 seconds by default. Override this for either the
 included host or the provider-neutral agent with `--python-timeout SECONDS`.
 

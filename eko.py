@@ -848,10 +848,19 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           effort: str | None = None, session_id: str | None = None,
           resume: bool = False,
           python_timeout: float = PYTHON_TIMEOUT,
-          max_turns: int = 0) -> None:
+          max_turns: int = 0, worker: Path | None = None) -> None:
     """Run the agent using JSON-lines stdin, stdout, and model socket."""
     if os.getpid() == 1:
         threading.Thread(target=_reap_children, daemon=True).start()
+    cwd = cwd.resolve()
+    if worker is not None:
+        worker = worker.resolve()
+        try:
+            worker.relative_to(cwd)
+        except ValueError as error:
+            raise ValueError("worker must be inside the workspace") from error
+        if not worker.is_file():
+            raise ValueError(f"worker does not exist: {worker}")
     write_lock = threading.Lock()
 
     def write(value: dict) -> None:
@@ -867,9 +876,17 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
         observer=lambda event: write(encode_event(event)), name=name,
         context=context, clean_workspace=clean_workspace,
         python_timeout=python_timeout, max_turns=max_turns)
-    agent.start(prompt)
-    write({"type": "ready", "session": str(agent.socket_path)})
+    worker_process = None
+    if worker is not None:
+        worker_environment = dict(os.environ)
+        worker_environment["EKO_SESSION"] = str(agent.socket_path)
+        worker_process = subprocess.Popen(
+            [sys.executable, str(worker)], cwd=cwd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, env=worker_environment)
     try:
+        agent.start(prompt)
+        write({"type": "ready", "session": str(agent.socket_path)})
         for line in sys.stdin:
             try:
                 message = json.loads(line)
@@ -889,6 +906,13 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
     finally:
         agent.stop()
         agent.wait(5)
+        if worker_process is not None and worker_process.poll() is None:
+            worker_process.terminate()
+            try:
+                worker_process.wait(2)
+            except subprocess.TimeoutExpired:
+                worker_process.kill()
+                worker_process.wait(2)
         if os.getpid() == 1:
             _shutdown_children()
 
@@ -920,6 +944,8 @@ def main() -> None:
         "--max-turns", type=int, default=0,
         help="stop a model response after this many model turns (0: unlimited)",
     )
+    parser.add_argument("--worker", type=Path,
+                        help="workspace Python file to run in the background")
     # Temporary experiment flag; remove after the workspace-hygiene evaluation.
     parser.add_argument("--clean-workspace", action="store_true")
     args = parser.parse_args()
@@ -937,7 +963,7 @@ def main() -> None:
           clean_workspace=args.clean_workspace, model=args.model,
           effort=args.effort, session_id=args.session_id or args.resume,
           resume=args.resume is not None, python_timeout=args.python_timeout,
-          max_turns=args.max_turns)
+          max_turns=args.max_turns, worker=args.worker)
 
 
 if __name__ == "__main__":

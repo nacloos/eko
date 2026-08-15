@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import argparse
 import io
 import json
 import os
@@ -1012,6 +1013,79 @@ class ModelTests(unittest.TestCase):
         )
 
         self.assertIn("--clean-workspace", command)
+
+    def test_agent_command_maps_workspace_worker_into_sandbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            worker = cwd / "jobs" / "worker.py"
+            command = host._agent_command(
+                cwd, Path("/tmp/runtime"), sandbox=True, feral=False,
+                name="Eko", worker=worker,
+            )
+
+        index = command.index("--worker")
+        self.assertEqual(command[index + 1], "/workspace/jobs/worker.py")
+
+    def test_agent_command_rejects_worker_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "inside the workspace"):
+                host._agent_command(
+                    Path(directory), Path("/tmp/runtime"), sandbox=False,
+                    feral=False, name="Eko", worker=Path("/tmp/worker.py"),
+                )
+
+    def test_standard_readonly_bind_mount_is_forwarded_to_sandbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            training = root / "training"
+            workspace.mkdir(); training.mkdir()
+            mount = host.parse_mount(
+                f"type=bind,source={training},target=/workspace/training,readonly")
+            command = host._agent_command(
+                workspace, root / "runtime", sandbox=True, feral=False,
+                name="Eko", mounts=(mount,))
+
+        index = command.index("--ro-bind", command.index("/workspace"))
+        self.assertEqual(command[index + 1:index + 3],
+                         [str(training.resolve()), "/workspace/training"])
+
+    def test_mount_aliases_and_standard_writable_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            mount = host.parse_mount(
+                f"type=bind,src={source},dst=/workspace/data")
+
+        self.assertEqual(mount.source, source.resolve())
+        self.assertEqual(mount.target, Path("/workspace/data"))
+        self.assertFalse(mount.readonly)
+
+    def test_mount_target_cannot_escape_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(argparse.ArgumentTypeError,
+                                        "inside /workspace"):
+                host.parse_mount(
+                    f"type=bind,source={directory},target=/run/eko")
+            with self.assertRaisesRegex(argparse.ArgumentTypeError,
+                                        "cannot escape"):
+                host.parse_mount(
+                    f"type=bind,source={directory},"
+                    "target=/workspace/../run/eko")
+
+    def test_mount_target_rejects_workspace_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            source = root / "source"
+            workspace.mkdir(); source.mkdir()
+            (workspace / "linked").symlink_to(root)
+            mount = host.parse_mount(
+                f"type=bind,source={source},target=/workspace/linked/data")
+
+            with self.assertRaisesRegex(ValueError, "symbolic links"):
+                host._agent_command(
+                    workspace, root / "runtime", sandbox=True, feral=False,
+                    name="Eko", mounts=(mount,))
 
     def test_headless_observer_ignores_initial_idle_then_finishes(self):
         observer = host.HeadlessObserver()

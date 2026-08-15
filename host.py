@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,6 +53,56 @@ MAX_DISPLAY_OUTPUT = 4_000
 MAX_DISPLAY_LINES = 5
 GOLD = "#d7af5f"
 GOLD_ACTIVE = "#e5bd68"
+
+
+@dataclass(frozen=True)
+class SandboxMount:
+    source: Path
+    target: Path
+    readonly: bool = False
+
+
+def parse_mount(value: str) -> SandboxMount:
+    """Parse Docker/Podman-style --mount type=bind,... syntax."""
+    options: dict[str, str] = {}
+    flags: set[str] = set()
+    aliases = {"src": "source", "dst": "target", "destination": "target"}
+    for item in value.split(","):
+        if "=" in item:
+            key, option = item.split("=", 1)
+            key = aliases.get(key, key)
+            if key in options:
+                raise argparse.ArgumentTypeError(f"duplicate mount option: {key}")
+            options[key] = option
+        else:
+            flags.add(item)
+    unknown = set(options) - {"type", "source", "target", "readonly", "ro"}
+    unknown |= flags - {"readonly", "ro"}
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown mount option: {sorted(unknown)[0]}")
+    if options.get("type") != "bind":
+        raise argparse.ArgumentTypeError("mount type must be bind")
+    if not options.get("source") or not options.get("target"):
+        raise argparse.ArgumentTypeError("mount requires source and target")
+    source = Path(options["source"]).expanduser().resolve()
+    if not source.exists():
+        raise argparse.ArgumentTypeError(f"mount source does not exist: {source}")
+    target = Path(options["target"])
+    try:
+        relative = target.relative_to("/workspace")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "mount target must be inside /workspace") from error
+    if relative == Path("."):
+        raise argparse.ArgumentTypeError("mount target cannot replace /workspace")
+    if ".." in relative.parts:
+        raise argparse.ArgumentTypeError("mount target cannot escape /workspace")
+    boolean = options.get("readonly", options.get("ro"))
+    if boolean is not None and boolean.lower() not in {"true", "false"}:
+        raise argparse.ArgumentTypeError("readonly must be true or false")
+    readonly = bool(flags & {"readonly", "ro"}) or boolean == "true"
+    return SandboxMount(source, target, readonly)
 
 
 def response_renderable(text: str):
@@ -792,7 +843,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    max_turns: int = 0,
                    clean_workspace: bool = False, model: str | None = None,
                    effort: str | None = None, session_id: str | None = None,
-                   resume: bool = False) -> list[str]:
+                   resume: bool = False, worker: Path | None = None,
+                   mounts: tuple[SandboxMount, ...] = ()) -> list[str]:
     source = Path(core.__file__).resolve()
     arguments = ["--cwd", "/workspace" if sandbox else str(cwd),
                  "--model-socket",
@@ -814,11 +866,43 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         arguments.append("--clean-workspace")
     if feral:
         arguments.append("--feral")
+    if worker is not None:
+        worker = worker.resolve()
+        try:
+            relative_worker = worker.relative_to(cwd)
+        except ValueError as error:
+            raise ValueError("worker must be inside the workspace") from error
+        target = Path("/workspace") / relative_worker if sandbox else worker
+        arguments.extend(("--worker", str(target)))
     if not sandbox:
+        if mounts:
+            raise ValueError("sandbox mounts require sandbox=True")
         return [sys.executable, str(source), *arguments]
     bwrap = shutil.which("bwrap")
     if bwrap is None:
         raise RuntimeError("--sandbox requires Bubblewrap (bwrap)")
+    targets = [mount.target for mount in mounts]
+    if len(targets) != len(set(targets)):
+        raise ValueError("sandbox mount targets must be unique")
+    for first in targets:
+        if any(first != second and first in second.parents for second in targets):
+            raise ValueError("sandbox mount targets must not overlap")
+    mount_arguments = []
+    for mount in mounts:
+        relative = mount.target.relative_to("/workspace")
+        placeholder = cwd / relative
+        candidate = cwd
+        for part in relative.parts:
+            candidate /= part
+            if candidate.is_symlink():
+                raise ValueError("sandbox mount target cannot contain symbolic links")
+        if mount.source.is_dir():
+            placeholder.mkdir(parents=True, exist_ok=True)
+        else:
+            placeholder.parent.mkdir(parents=True, exist_ok=True)
+            placeholder.touch(exist_ok=True)
+        mount_arguments.extend(("--ro-bind" if mount.readonly else "--bind",
+                                str(mount.source), str(mount.target)))
     environment = Path(sys.prefix).resolve()
     interpreter = Path(sys.executable).resolve()
     base = interpreter.parents[1]
@@ -835,7 +919,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         "--ro-bind", str(environment), "/opt/eko", "--dir", "/run",
         "--dir", "/opt/eko-packages", *package_mounts,
         "--ro-bind", str(source), "/run/eko.py",
-        "--bind", str(cwd), "/workspace", "--bind", str(runtime), "/run/eko",
+        "--bind", str(cwd), "/workspace", *mount_arguments,
+        "--bind", str(runtime), "/run/eko",
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
         "--remount-ro", "/", "--setenv", "HOME", "/workspace",
         "--setenv", "TMPDIR", "/tmp", "--setenv", "LANG", "C.UTF-8",
@@ -888,7 +973,9 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         clean_workspace: bool = False,
         python_timeout: float = core.PYTHON_TIMEOUT,
         max_turns: int = 0, exit_when_idle: bool = False,
-        upstream_model_socket: Path | None = None) -> None:
+        upstream_model_socket: Path | None = None,
+        worker: Path | None = None,
+        mounts: tuple[SandboxMount, ...] = ()) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -921,7 +1008,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
                 cwd, runtime, sandbox=sandbox, feral=feral, name=name,
                 context=context, clean_workspace=clean_workspace,
                 python_timeout=python_timeout, max_turns=max_turns,
-                model=model, effort=effort, session_id=session_id, resume=resume
+                model=model, effort=effort, session_id=session_id, resume=resume,
+                worker=worker, mounts=mounts,
             ),
             env=environment,
         )
@@ -990,6 +1078,10 @@ def main() -> None:
     )
     parser.add_argument("--sandbox", action="store_true")
     parser.add_argument(
+        "--mount", action="append", type=parse_mount, default=[],
+        help="sandbox mount: type=bind,source=PATH,target=/workspace/PATH[,readonly]",
+    )
+    parser.add_argument(
         "--feral", action="store_true",
         help="start immediately and keep acting autonomously",
     )
@@ -1001,6 +1093,8 @@ def main() -> None:
         "--upstream-model-socket", type=Path,
         help="relay model requests to an existing host-side model service",
     )
+    parser.add_argument("--worker", type=Path,
+                        help="workspace Python file to run in the sandbox background")
     session = parser.add_mutually_exclusive_group()
     session.add_argument(
         "--session-id", help="UUID to use for a new primary conversation"
@@ -1015,6 +1109,8 @@ def main() -> None:
         parser.error("--max-turns must not be negative")
     if args.exit_when_idle and not args.headless:
         parser.error("--exit-when-idle requires --headless")
+    if args.mount and not args.sandbox:
+        parser.error("--mount requires --sandbox")
 
     def launch(cwd: Path) -> None:
         run(cwd, args.prompt, model=args.model, effort=args.effort,
@@ -1025,7 +1121,8 @@ def main() -> None:
             clean_workspace=args.clean_workspace,
             python_timeout=args.python_timeout, max_turns=args.max_turns,
             exit_when_idle=args.exit_when_idle,
-            upstream_model_socket=args.upstream_model_socket)
+            upstream_model_socket=args.upstream_model_socket,
+            worker=args.worker, mounts=tuple(args.mount))
 
     try:
         if args.feral and args.cwd is None:
