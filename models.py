@@ -7,8 +7,11 @@ import json
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import os
+import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -23,6 +26,72 @@ MAX_TOKENS = 8192
 DEFAULT_MODEL = "thinkingmachines/Inkling-Small"
 SESSION_VERSION = 3
 EFFORT = {"low": .2, "medium": .7, "high": .9, "xhigh": .99, "max": .99}
+PYTHON_TOOL = {
+    "name": "python",
+    "description": "Run Python in the agent's workspace and return its result.",
+    "parameters": {
+        "type": "object",
+        "properties": {"code": {"type": "string"}},
+        "required": ["code"],
+        "additionalProperties": False,
+    },
+}
+
+
+def mcp_python_tool() -> dict:
+    """Describe Python to MCP clients, including Claude's text result budget."""
+    return {
+        "name": "python", "description": PYTHON_TOOL["description"],
+        "inputSchema": PYTHON_TOOL["parameters"],
+        "_meta": {"anthropic/maxResultSizeChars": 500_000},
+    }
+
+
+def tool_result_parts(result: core.Result) -> tuple[core.Content, ...]:
+    """Build the canonical ordered, attributed Python observation stream."""
+    output = result.output or "(no output)"
+    if result.returncode:
+        output = f"Exit code {result.returncode}\n{output}"
+    parts: list[core.Content] = [core.Text(output)]
+    if result.inputs:
+        parts.append(core.Text("\n\n"))
+        parts.extend(core.attributed_content(result.inputs))
+    return tuple(parts)
+
+
+def tinker_content(parts: tuple[core.Content, ...]) -> list[dict]:
+    """Encode provider-neutral parts for Tinker's multimodal renderer."""
+    content: list[dict] = []
+    for part in parts:
+        if isinstance(part, core.Text):
+            if content and content[-1]["type"] == "text":
+                content[-1]["text"] += part.text
+            else:
+                content.append({"type": "text", "text": part.text})
+        else:
+            data = base64.b64encode(part.data).decode()
+            content.append({"type": "image", "image":
+                            f"data:{part.media_type};base64,{data}"})
+    return content
+
+
+def tinker_tool_content(result: core.Result) -> list[dict]:
+    """Encode canonical result parts for Tinker's multimodal renderer."""
+    return tinker_content(tool_result_parts(result))
+
+
+def mcp_tool_content(result: core.Result) -> list[dict]:
+    """Encode canonical result parts as MCP text and image blocks."""
+    content: list[dict] = []
+    for part in tool_result_parts(result):
+        if isinstance(part, core.Text):
+            content.append({"type": "text", "text": part.text})
+        else:
+            content.append({
+                "type": "image", "mimeType": part.media_type,
+                "data": base64.b64encode(part.data).decode(),
+            })
+    return content
 
 
 def session_file(session_id: str) -> Path:
@@ -32,10 +101,12 @@ def session_file(session_id: str) -> Path:
 
 
 def _message(message: core.Message) -> dict:
-    if any(not isinstance(part, core.Text) for part in message.content):
-        raise ValueError("the Tinker model provider does not support image input")
-    return {"role": message.role,
-            "content": "".join(part.text for part in message.content)}
+    if all(isinstance(part, core.Text) for part in message.content):
+        content: str | list[dict] = "".join(
+            part.text for part in message.content if isinstance(part, core.Text))
+    else:
+        content = tinker_content(message.content)
+    return {"role": message.role, "content": content}
 
 
 class Tinker:
@@ -142,12 +213,15 @@ class Tinker:
             if isinstance(part, dict) and part.get("type") == "text")
 
     def complete(self, system: str, message: core.Message,
-                 on_text: Callable[[str], None]) -> core.Message:
+                 on_text: Callable[[str], None],
+                 on_python: Callable[[str], core.Result]) -> core.Message:
         if message.role != "user":
             raise ValueError("model input must be a user message")
         if self.system is None:
             self.system = system
-            self.messages = [{"role": "system", "content": system}]
+            _client, renderer = self._connect()
+            self.messages = renderer.create_conversation_prefix_with_tools(
+                [PYTHON_TOOL], system)
         elif self.system != system:
             raise ValueError("session system context does not match this invocation")
         self.interrupted.clear()
@@ -155,36 +229,56 @@ class Tinker:
         client, renderer = self._connect()
         options = ({"effort": EFFORT[self.effort]}
                    if self.effort is not None else {})
-        prompt = renderer.build_generation_prompt(
-            [*self.messages, user], **options)
-
+        messages = [*self.messages, user]
         import tinker
-
-        future = client.sample(
-            prompt, num_samples=1,
-            sampling_params=tinker.SamplingParams(
-                max_tokens=MAX_TOKENS, stop=renderer.get_stop_sequences()))
-        deadline = time.monotonic() + CALL_TIMEOUT
         while True:
-            if self.interrupted.is_set():
-                raise InterruptedError
-            try:
-                remaining = max(0, deadline - time.monotonic())
-                response = future.result(timeout=min(.1, remaining))
+            prompt = renderer.build_generation_prompt(messages, **options)
+            future = client.sample(
+                prompt, num_samples=1,
+                sampling_params=tinker.SamplingParams(
+                    max_tokens=MAX_TOKENS, stop=renderer.get_stop_sequences()))
+            deadline = time.monotonic() + CALL_TIMEOUT
+            while True:
+                if self.interrupted.is_set():
+                    raise InterruptedError
+                try:
+                    remaining = max(0, deadline - time.monotonic())
+                    response = future.result(timeout=min(.1, remaining))
+                    break
+                except FutureTimeout:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"model response timed out after {CALL_TIMEOUT}s")
+            parsed, _termination = renderer.parse_response(
+                response.sequences[0].tokens)
+            assistant = dict(parsed)
+            calls = assistant.get("tool_calls") or []
+            if not calls:
+                answer = self._text(assistant)
+                on_text(answer)
+                messages.append(assistant)
                 break
-            except FutureTimeout:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"model response timed out after {CALL_TIMEOUT}s")
-
-        parsed, _termination = renderer.parse_response(response.sequences[0].tokens)
-        assistant = {"role": "assistant", "content": parsed.get("content", "")}
-        answer = self._text(assistant)
-        on_text(answer)
-        messages = [*self.messages, user, assistant]
+            assistant["tool_calls"] = [
+                call.model_dump(mode="json") if hasattr(call, "model_dump") else call
+                for call in calls
+            ]
+            messages.append(assistant)
+            for call in calls:
+                if call.function.name != "python":
+                    raise RuntimeError(f"unsupported tool: {call.function.name}")
+                arguments = json.loads(call.function.arguments)
+                code = arguments.get("code")
+                if not isinstance(code, str):
+                    raise RuntimeError("python tool requires string code")
+                result = on_python(code)
+                messages.append({
+                    "role": "tool", "name": "python",
+                    "tool_call_id": call.id or "",
+                    "content": tinker_tool_content(result),
+                })
         self._save(messages)
         self.messages = messages
-        self.context_used = len(prompt.to_ints())
+        self.context_used = sum(int(chunk.length) for chunk in prompt.chunks)
         return core.Message("assistant", (core.Text(answer),))
 
     def close(self) -> None:
@@ -201,9 +295,116 @@ def ensure_tinker_auth() -> None:
             "https://tinker-console.thinkingmachines.ai/keys")
 
 
-# ── Claude model connection ───────────────────────────────────────────────────
+class PythonBroker:
+    """Forward one MCP Python call to the active sandbox executor."""
 
-CALL_TIMEOUT = 300
+    def __init__(self) -> None:
+        self.directory = tempfile.TemporaryDirectory(prefix="eko-python-")
+        self.path = Path(self.directory.name) / "tool.sock"
+        self.token = uuid.uuid4().hex
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        self.listener.listen()
+        self.handler: Callable[[str], core.Result] | None = None
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stopping.is_set():
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            threading.Thread(
+                target=self._serve, args=(connection,), daemon=True).start()
+
+    def _serve(self, connection: socket.socket) -> None:
+        with connection, connection.makefile("rb") as stream:
+            try:
+                request = json.loads(stream.readline())
+                if request.get("token") != self.token:
+                    raise ValueError("invalid tool token")
+                code = request.get("code")
+                if not isinstance(code, str):
+                    raise ValueError("python tool requires string code")
+                with self.lock:
+                    handler = self.handler
+                if handler is None:
+                    raise RuntimeError("no active model request")
+                result = handler(code)
+                response = {
+                    "output": result.output, "returncode": result.returncode,
+                    "elapsed": result.elapsed,
+                    "inputs": [core.encode_input(item) for item in result.inputs],
+                }
+            except Exception as error:
+                response = {"error": str(error)}
+            try:
+                connection.sendall(
+                    (json.dumps(response, separators=(",", ":")) + "\n").encode())
+            except OSError:
+                # The provider may close its MCP connection while Eko is
+                # completing the interrupted tool-result handshake.
+                pass
+
+    def close(self) -> None:
+        if self.stopping.is_set():
+            return
+        self.stopping.set()
+        self.listener.close()
+        self.thread.join(2)
+        self.directory.cleanup()
+
+
+def serve_mcp(endpoint: Path, token: str) -> None:
+    """Serve the single Python MCP tool over stdio."""
+
+    def send(value: dict) -> None:
+        print(json.dumps(value, separators=(",", ":")), flush=True)
+
+    for line in sys.stdin:
+        request = json.loads(line)
+        request_id = request.get("id")
+        method = request.get("method")
+        if method == "initialize":
+            result = {
+                "protocolVersion": request.get("params", {}).get(
+                    "protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "eko", "version": "1"},
+            }
+        elif method == "tools/list":
+            result = {"tools": [mcp_python_tool()]}
+        elif method == "tools/call":
+            code = request.get("params", {}).get("arguments", {}).get("code")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.connect(str(endpoint))
+                connection.sendall((json.dumps({
+                    "token": token, "code": code,
+                }, separators=(",", ":")) + "\n").encode())
+                response = json.loads(connection.makefile("rb").readline())
+            if "error" in response:
+                result = {"content": [{"type": "text", "text": response["error"]}],
+                          "isError": True}
+            else:
+                value = core.Result(
+                    response["output"], response["returncode"], response["elapsed"],
+                    tuple(core.decode_encoded_input(item)
+                          for item in response.get("inputs", [])))
+                result = {"content": mcp_tool_content(value),
+                          "isError": value.returncode != 0}
+        else:
+            if request_id is not None:
+                send({"jsonrpc": "2.0", "id": request_id, "error": {
+                    "code": -32601, "message": "Method not found"}})
+            continue
+        if request_id is not None:
+            send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
+# ── Claude model connection ───────────────────────────────────────────────────
 
 
 def _claude_content(message: core.Message) -> list[dict]:
@@ -223,11 +424,11 @@ def _claude_content(message: core.Message) -> list[dict]:
 
 
 class Claude:
-    """A persistent, tool-free connection to the LLM through the Claude CLI.
+    """A persistent native-tool connection to the LLM through the Claude CLI.
 
-    Stream JSON lets several Eko turns share one model conversation. ``--safe-mode``
-    prevents machine-specific instructions, hooks, plugins, and skills from changing
-    the model's context, while ``--tools ''`` leaves generated Python as its only action.
+    Stream JSON shares one conversation across Eko turns. Built-ins, settings, hooks,
+    plugins, and skills are disabled; one explicitly configured MCP server exposes the
+    sandbox-backed Python tool.
     """
 
     def __init__(self, cwd: Path, model: str = "claude-opus-5",
@@ -242,6 +443,8 @@ class Claude:
         self.started = resume
         self.interrupted = threading.Event()
         self.context_used = 0
+        self.broker = PythonBroker()
+        self.write_lock = threading.Lock()
 
     def _repair_session(self) -> bool:
         """Repair this session's empty assistant text blocks."""
@@ -278,8 +481,17 @@ class Claude:
     def _start(self, system: str) -> None:
         session = (["--resume", self.session_id] if self.started else
                    ["--session-id", self.session_id])
+        config = json.dumps({"mcpServers": {"eko": {
+            "command": sys.executable,
+            "args": [str(Path(__file__).resolve()), "--mcp",
+                     str(self.broker.path), self.broker.token],
+        }}})
         command = [
-            "claude", "-p", "--verbose", "--safe-mode", "--tools", "",
+            "claude", "-p", "--verbose", "--tools", "",
+            "--strict-mcp-config", "--mcp-config", config,
+            "--allowedTools", "mcp__eko__python", "--permission-mode", "dontAsk",
+            "--setting-sources", "", "--settings", "{}",
+            "--disable-slash-commands",
             "--model", self.model, "--effort", self.effort,
             *session,
             "--input-format", "stream-json", "--output-format", "stream-json",
@@ -290,6 +502,14 @@ class Claude:
             command, cwd=self.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
         self.started = True
+
+    def _write(self, event: dict) -> None:
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            raise RuntimeError("Claude session is not running")
+        with self.write_lock:
+            proc.stdin.write((json.dumps(event) + "\n").encode())
+            proc.stdin.flush()
 
     def _terminate(self, signum: int, grace: float = 2) -> None:
         """Signal the CLI process group and ensure it is collected."""
@@ -316,6 +536,7 @@ class Claude:
 
     def complete(self, system: str, message: core.Message,
                  on_text: Callable[[str], None],
+                 on_python: Callable[[str], core.Result] | None = None,
                  deadline: float | None = None,
                  retry_delay: float = .2) -> core.Message:
         """Complete a history using the CLI's internally persisted conversation."""
@@ -330,8 +551,9 @@ class Claude:
         assert proc is not None and proc.stdin and proc.stdout
         event = {"type": "user", "message": {
             "role": "user", "content": _claude_content(message)}}
-        proc.stdin.write((json.dumps(event) + "\n").encode())
-        proc.stdin.flush()
+        self._write(event)
+        with self.broker.lock:
+            self.broker.handler = on_python
 
         parts: list[str] = []
         complete = ""
@@ -361,6 +583,8 @@ class Claude:
                     block["text"] for block in data["message"].get("content", [])
                     if block.get("type") == "text")
             elif data.get("type") == "result":
+                with self.broker.lock:
+                    self.broker.handler = None
                 if data.get("is_error"):
                     detail = data.get("result") or data.get("error")
                     if resuming:
@@ -370,7 +594,8 @@ class Claude:
                         if ("text content blocks must be non-empty" in str(detail)
                                 and self._repair_session()):
                             return self.complete(
-                                system, message, on_text, deadline, retry_delay)
+                                system, message, on_text, on_python,
+                                deadline, retry_delay)
                         remaining = deadline - time.monotonic()
                         if remaining > 0 and not parts and not complete:
                             delay = min(retry_delay, remaining)
@@ -378,7 +603,7 @@ class Claude:
                                 raise InterruptedError
                             if time.monotonic() < deadline:
                                 return self.complete(
-                                    system, message, on_text, deadline,
+                                    system, message, on_text, on_python, deadline,
                                     min(retry_delay * 2, 5))
                         raise RuntimeError(
                             "Model session could not resume; context was not "
@@ -398,6 +623,7 @@ class Claude:
         """Give the CLI a brief chance to flush its session, then stop it."""
         proc = self.proc
         if proc is None:
+            self.broker.close()
             return
         if proc.poll() is None:
             try:
@@ -412,6 +638,7 @@ class Claude:
             proc.stdout.close()
         if self.proc is proc:
             self.proc = None
+        self.broker.close()
 
     def interrupt(self) -> None:
         self.interrupted.set()
@@ -447,3 +674,10 @@ def ensure_claude_auth() -> None:
     subprocess.run(["claude", "auth", "login", "--claudeai"], check=False)
     if not auth_status():
         raise SystemExit("Claude sign-in did not complete.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--mcp":
+        serve_mcp(Path(sys.argv[2]), sys.argv[3])
+    else:
+        raise SystemExit("models.py is an internal module")

@@ -15,6 +15,7 @@ import argparse
 import io
 import json
 import os
+import queue
 import shutil
 import signal
 import socket
@@ -23,13 +24,12 @@ import sys
 import tempfile
 import threading
 import time
-import tokenize
 import uuid
 from pathlib import Path
 from typing import Callable
 
 import eko as core
-from models import (Claude, Tinker, _claude_content, ensure_claude_auth,
+from models import (CALL_TIMEOUT, Claude, Tinker, _claude_content, ensure_claude_auth,
                     ensure_tinker_auth)
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
@@ -55,19 +55,16 @@ GOLD_ACTIVE = "#e5bd68"
 
 
 def response_renderable(text: str):
-    """Render executable Python as panels and leave Markdown intact."""
-    text = text.replace("<done/>", "")
-    items = []
-    for kind, content, _closed in core.response_segments(text):
-        if kind == "prose" and content.strip():
-            items.append(Markdown(content.strip()))
-        elif kind == "python":
-            items.append(Panel(
-                Syntax(content.rstrip("\n") or " ", "python",
-                       theme="ansi_dark", word_wrap=True),
-                title=f"[bold {GOLD}]python[/bold {GOLD}]", title_align="left",
-                border_style=GOLD, padding=(0, 1)))
-    return Group(*items)
+    """Render assistant Markdown without its completion marker."""
+    return Markdown(text.replace("<done/>", "").strip())
+
+
+def python_renderable(code: str):
+    """Render one completed native Python tool call."""
+    return Panel(
+        Syntax(code.rstrip("\n") or " ", "python", theme="ansi_dark", word_wrap=True),
+        title=f"[bold {GOLD}]python[/bold {GOLD}]", title_align="left",
+        border_style=GOLD, padding=(0, 1))
 
 
 def display_output(text: str, width: int = 120) -> str:
@@ -91,7 +88,7 @@ def display_output(text: str, width: int = 120) -> str:
 
 
 class NativeStream:
-    """Append stable model-output lines without redrawing terminal history."""
+    """Append stable Markdown blocks without redrawing terminal history."""
 
     def __init__(self, ui: UI) -> None:
         self.ui = ui
@@ -99,12 +96,7 @@ class NativeStream:
         self.buffer = ""
         self.pending_output: list[str] = []
         self.last_flush = time.monotonic()
-        self.code = False
-        self.fence_length = 0
-        self.box_open = False
         self.prose = ""
-        self.code_lines: list[str] = []
-        self.code_emitted = 0
 
     def feed(self, delta: str) -> None:
         self.text += delta
@@ -125,36 +117,12 @@ class NativeStream:
     def _drain(self, final: bool = False) -> None:
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
-            self._line(line + "\n")
+            self._prose(line + "\n")
         if final and self.buffer:
             line, self.buffer = self.buffer, ""
-            self._line(line)
-        if final:
-            if self.code:
-                self._commit_code(final=True)
-                self._close_box()
-                self.code = False
-            else:
-                self._prose("", final=True)
-
-    def _line(self, line: str) -> None:
-        if self.code:
-            if core.closing_fence(line, self.fence_length):
-                self._commit_code(final=True)
-                self._close_box()
-                self.code = False
-                self.fence_length = 0
-            else:
-                self.code_lines.append(line.rstrip("\r\n"))
-                self._commit_code()
-            return
-        if length := core.opening_fence(line):
-            self._prose("", final=True)
-            self.code = True
-            self.fence_length = length
-            self._open_box()
-        else:
             self._prose(line)
+        if final:
+            self._prose("", final=True)
 
     def _prose(self, text: str, final: bool = False) -> None:
         text = text.replace("<done/>", "")
@@ -172,63 +140,8 @@ class NativeStream:
         if text.strip():
             self._queue(self.ui._render(Markdown(text.strip())) + "\n")
 
-    def _width(self) -> int:
-        return max(20, shutil.get_terminal_size().columns - 2)
-
-    def _open_box(self) -> None:
-        self.code_lines = []
-        self.code_emitted = 0
-        width = self._width()
-        title = "─ python "
-        self._queue(self.ui._render(RichText(
-            "╭" + title + "─" * max(0, width - len(title) - 2) + "╮",
-            style=f"bold {GOLD}")))
-        self.box_open = True
-
-    def _stable_code_lines(self) -> int:
-        """Return the prefix whose Python highlighting cannot change later."""
-        source = "\n".join(self.code_lines) + "\n"
-        stable = len(self.code_lines)
-        try:
-            list(tokenize.generate_tokens(io.StringIO(source).readline))
-        except (tokenize.TokenError, IndentationError, SyntaxError) as error:
-            location = error.args[1] if len(error.args) > 1 else None
-            if isinstance(location, tuple):
-                stable = min(stable, max(0, location[0] - 1))
-        return stable
-
-    def _commit_code(self, final: bool = False) -> None:
-        end = len(self.code_lines) if final else self._stable_code_lines()
-        if end <= self.code_emitted:
-            return
-        source = "\n".join(self.code_lines) + "\n"
-        highlighted = Syntax("", "python", theme="ansi_dark").highlight(source)
-        lines = highlighted.split("\n")
-        for line in lines[self.code_emitted:end]:
-            self._code_line(line)
-        self.code_emitted = end
-
-    def _code_line(self, line: RichText) -> None:
-        width = self._width()
-        content = line[:max(1, width - 4)]
-        padding = " " * max(0, width - len(content.plain) - 4)
-        row = RichText()
-        row.append("│ ", style=GOLD)
-        row.append_text(content)
-        row.append(padding)
-        row.append(" │", style=GOLD)
-        self._queue(self.ui._render(row))
-
-    def _close_box(self) -> None:
-        if self.box_open:
-            width = self._width()
-            self._queue(self.ui._render(RichText(
-                "╰" + "─" * (width - 2) + "╯", style=GOLD)))
-            self.box_open = False
-
     def finish(self) -> None:
         self._drain(final=True)
-        self._close_box()
         self._flush()
 
 
@@ -318,9 +231,12 @@ class UI:
                 if stream is not None:
                     stream.finish()
                     stream = None
-                response, _ = event.value
+                response, code = event.value
                 self.streamed_response = response
-                self.assistant(response)
+                if code is not None:
+                    self._append(self._render(python_renderable(code)) + "\n")
+                elif response:
+                    self.assistant(response)
             elif event.type == "result":
                 self._stop_activity()
                 self.result(event.value)
@@ -579,6 +495,7 @@ def _model_client(connection: socket.socket, cwd: Path,
     conversation = None
     lock = threading.Lock()
     active: threading.Thread | None = None
+    tool_results: dict[str, queue.Queue[core.Result]] = {}
 
     def send(value: dict) -> None:
         data = (json.dumps(value, separators=(",", ":")) + "\n").encode()
@@ -589,11 +506,21 @@ def _model_client(connection: socket.socket, cwd: Path,
                 pass
 
     def complete(message: dict) -> None:
+        def python(code: str) -> core.Result:
+            call_id = uuid.uuid4().hex
+            result: queue.Queue[core.Result] = queue.Queue(maxsize=1)
+            tool_results[call_id] = result
+            send({"tool_call": {"id": call_id, "code": code}})
+            try:
+                return result.get(timeout=CALL_TIMEOUT)
+            finally:
+                tool_results.pop(call_id, None)
+
         try:
             assert conversation is not None
             reply = conversation.complete(
                 system, core.decode_message(message),
-                lambda text: send({"delta": text}))
+                lambda text: send({"delta": text}), python)
             send({"message": core.encode_message(reply),
                   "context_used": conversation.context_used})
         except InterruptedError:
@@ -634,6 +561,17 @@ def _model_client(connection: socket.socket, cwd: Path,
                         return
                     if request.get("interrupt") is True:
                         conversation.interrupt()
+                    elif isinstance(request.get("tool_result"), dict):
+                        raw = request["tool_result"]
+                        waiting = tool_results.get(raw.get("id"))
+                        if waiting is not None:
+                            waiting.put(core.Result(
+                                str(raw.get("output", "")),
+                                int(raw.get("returncode", 1)),
+                                float(raw.get("elapsed", 0)),
+                                tuple(core.decode_encoded_input(item)
+                                      for item in raw.get("inputs", [])),
+                            ))
                     elif (isinstance(request.get("message"), dict) and
                           (active is None or not active.is_alive())):
                         active = threading.Thread(

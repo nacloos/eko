@@ -116,9 +116,10 @@ or as base64 data from memory or another workspace:
 ```
 
 The receiver assigns provenance using the delivery path and Unix peer credentials;
-senders do not claim a source. Model inputs are headed `[terminal]`,
-`[python exit=N]`, `[process-PID]`, or `[harness]`. Multiple inputs may be grouped
-into one user-role message without losing their individual provenance.
+senders do not claim a source. Eko wraps each model input in an attributed
+`<input source="...">` element. Inputs that arrive during Python execution are
+returned, in order and with any images intact, in that native tool result before
+the model chooses its next action.
 
 Send `{"type":"interrupt"}` to interrupt the agent's current model call or Python
 execution.

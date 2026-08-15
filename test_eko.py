@@ -50,6 +50,11 @@ class FakeUI:
         self.results: list[eko.Result] = []
 
 
+class PythonCall:
+    def __init__(self, code: str) -> None:
+        self.code = code
+
+
 class FakeModel:
     def __init__(self, replies) -> None:
         self.replies = replies
@@ -62,16 +67,26 @@ class FakeModel:
     def start(self, system):
         self.system = system
 
-    def send(self, message, write):
-        text = eko.message_text(message).split("\n", 1)[-1]
+    def send(self, message, write, python=lambda _code: None):
+        text = "\n".join(
+            line for line in eko.message_text(message).splitlines()
+            if not line.startswith("<input source=") and line != "</input>"
+        )
         self.messages.append(text)
         reply = self.replies(text, self.cancelled)
+        while isinstance(reply, PythonCall):
+            result = python(reply.code)
+            observation = "".join(
+                part.text for part in models.tool_result_parts(result)
+                if isinstance(part, eko.Text))
+            self.messages.append(observation)
+            reply = self.replies(observation, self.cancelled)
         write(reply)
         return eko.Message("assistant", (eko.Text(reply),))
 
-    def complete(self, system, message, write):
+    def complete(self, system, message, write, python=lambda _code: None):
         self.start(system)
-        return self.send(message, write)
+        return self.send(message, write, python)
 
     def interrupt(self):
         self.cancelled.set()
@@ -90,6 +105,20 @@ class CoreTests(unittest.TestCase):
         agent = eko.Eko(Path.cwd(), FakeModel(lambda *_: "<done/>"))
 
         self.assertEqual(agent.python_timeout, 30)
+
+    def test_system_distinguishes_user_steering_from_async_observations(self):
+        self.assertIn('Source "user-terminal" is a controlling user', eko.SYSTEM)
+        self.assertIn('before continuing the current plan', eko.SYSTEM)
+        self.assertIn('Process and harness inputs are observations', eko.SYSTEM)
+        self.assertIn('never demote\na user-terminal instruction', eko.SYSTEM)
+        self.assertIn('<done/> and a Python tool call are mutually exclusive',
+                      eko.NORMAL_MODE)
+        self.assertNotIn('Python block', eko.NORMAL_MODE)
+
+    def test_mcp_python_tool_raises_claude_text_result_limit(self):
+        tool = models.mcp_python_tool()
+        self.assertEqual(tool["name"], "python")
+        self.assertEqual(tool["_meta"]["anthropic/maxResultSizeChars"], 500_000)
 
     def test_python_action_timeout_is_configurable(self):
         result = eko._run_python(
@@ -156,7 +185,7 @@ class CoreTests(unittest.TestCase):
         ))
 
     def test_inputs_are_limited_independently(self):
-        first = eko.limit_input(eko.Input("terminal", (eko.Text("a" * 12),)), 4)
+        first = eko.limit_input(eko.Input(eko.TERMINAL, (eko.Text("a" * 12),)), 4)
         second = eko.limit_input(eko.Input("python", (eko.Text("b" * 12),)), 4)
 
         self.assertEqual(first.content[0], eko.Text("aa"))
@@ -164,18 +193,102 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(second.content[0], eko.Text("bb"))
         self.assertEqual(second.content[-1], eko.Text("bb"))
 
-    def test_model_content_uses_plain_attribution_headers(self):
+    def test_model_content_uses_canonical_attributed_elements(self):
         message = eko.user_message((
             eko.Input(eko.TERMINAL, (eko.Text("hello"),)),
-            eko.Input(eko.PYTHON, (eko.Text("output"),), 1),
+            eko.Input("python", (eko.Text("output"),), 1),
         ))
         content = host._claude_content(message)
         self.assertEqual(content, [
-            {"type": "text", "text": "[terminal]\n"},
+            {"type": "text", "text": '<input source="user-terminal">\n'},
             {"type": "text", "text": "hello"},
-            {"type": "text", "text": "\n\n[python exit=1]\n"},
+            {"type": "text", "text": "\n</input>"},
+            {"type": "text", "text":
+             "\n\n<input source=\"python\" exit=\"1\">\n"},
             {"type": "text", "text": "output"},
+            {"type": "text", "text": "\n</input>"},
         ])
+
+    def test_native_tool_result_preserves_sources_order_and_images(self):
+        image = eko.Image("image/png", b"png", "frame.png")
+        result = eko.Result("done\n", 0, 1.2, (
+            eko.Input("process-123", (eko.Text("frame"), image)),
+            eko.Input(eko.TERMINAL, (eko.Text("stop"),)),
+        ))
+
+        parts = models.tool_result_parts(result)
+        self.assertEqual(parts, (
+            eko.Text("done\n"),
+            eko.Text("\n\n"),
+            eko.Text('<input source="process-123">\n'),
+            eko.Text("frame"), image, eko.Text("\n</input>"),
+            eko.Text('\n\n<input source="user-terminal">\n'),
+            eko.Text("stop"), eko.Text("\n</input>"),
+        ))
+        mcp = models.mcp_tool_content(result)
+        self.assertEqual([part["type"] for part in mcp],
+                         ["text", "text", "text", "text", "image",
+                          "text", "text", "text", "text"])
+        self.assertEqual(mcp[4]["mimeType"], "image/png")
+
+    def test_async_sources_after_user_terminal_preserve_exact_order(self):
+        result = eko.Result("ok", 0, .1, (
+            eko.Input(eko.TERMINAL, (eko.Text("do this instead"),)),
+            eko.Input(eko.HARNESS, (eko.Text("Context is 90% full."),)),
+            eko.Input("process-404", (eko.Text("worker completed"),)),
+        ))
+        text = "".join(part.text for part in models.tool_result_parts(result)
+                       if isinstance(part, eko.Text))
+        self.assertLess(text.index('source="user-terminal"'),
+                        text.index('source="harness"'))
+        self.assertLess(text.index('source="harness"'),
+                        text.index('source="process-404"'))
+
+    def test_failed_native_tool_result_matches_command_convention(self):
+        result = eko.Result("traceback\n", 3, .1)
+        self.assertEqual(models.tool_result_parts(result),
+                         (eko.Text("Exit code 3\ntraceback\n"),))
+
+    def test_python_result_is_bounded_before_queued_inputs(self):
+        output = "a" * (eko.MAX_INPUT_TEXT + 100)
+        bounded = eko.limit_text(output)
+        self.assertIn("100 characters omitted", bounded)
+        result = eko.Result(bounded, 0, .1, (
+            eko.Input("process-7", (eko.Text("important"),)),
+        ))
+        text = "".join(part.text for part in models.tool_result_parts(result)
+                       if isinstance(part, eko.Text))
+        self.assertTrue(text.endswith(
+            '<input source="process-7">\nimportant\n</input>'))
+
+    def test_tinker_user_and_tool_messages_keep_native_images(self):
+        image = eko.Image("image/png", b"png", "frame.png")
+        user = models._message(eko.Message(
+            "user", (eko.Text("before"), image, eko.Text("after"))))
+        tool = models.tinker_tool_content(eko.Result(
+            "done", 0, .1, (eko.Input("process-1", (image,)),)))
+
+        self.assertEqual([part["type"] for part in user["content"]],
+                         ["text", "image", "text"])
+        self.assertEqual([part["type"] for part in tool],
+                         ["text", "image", "text"])
+        self.assertIn('<input source="process-1">', tool[0]["text"])
+        self.assertEqual(tool[2]["text"], "\n</input>")
+        self.assertTrue(user["content"][1]["image"].startswith(
+            "data:image/png;base64,"))
+
+    def test_tinker_coalesces_one_text_tool_result_into_one_block(self):
+        result = eko.Result("done\n", 0, .1, (
+            eko.Input(eko.TERMINAL, (eko.Text("do this instead"),)),
+            eko.Input(eko.HARNESS, (eko.Text("Context is 90% full."),)),
+            eko.Input("process-7", (eko.Text("worker completed"),)),
+        ))
+        content = models.tinker_tool_content(result)
+        self.assertEqual(len(content), 1)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertIn('<input source="user-terminal">', content[0]["text"])
+        self.assertIn('<input source="harness">', content[0]["text"])
+        self.assertIn('<input source="process-7">', content[0]["text"])
 
 
 class ModelSocketTests(unittest.TestCase):
@@ -262,7 +375,8 @@ class ModelSocketTests(unittest.TestCase):
         events = (
             eko.Event("state", "thinking"),
             eko.Event("input", eko.Message("user", (
-                eko.Text("[terminal]\n"), eko.Text("hello")))),
+                eko.Text('<input source="user-terminal">\n'), eko.Text("hello"),
+                eko.Text("\n</input>")))),
             eko.Event("response", ("answer", "print(1)")),
             eko.Event("result", eko.Result("1\n", 0, .1)),
         )
@@ -368,7 +482,7 @@ class ProcessInterfaceTests(unittest.TestCase):
         self.assertIn("You are Moa.", requests[0]["system"])
         self.assertEqual(
             eko.message_text(eko.decode_message(requests[0]["message"])),
-            "[terminal]\nhello")
+            '<input source="user-terminal">\nhello\n</input>')
         self.assertTrue(any(event["type"] == "delta" for event in events))
 
 
@@ -399,65 +513,24 @@ class EkoTests(unittest.TestCase):
 
         self.assertEqual([message.role for message in agent.messages],
                          ["user", "assistant"])
-        self.assertEqual(eko.message_text(agent.messages[0]), "[terminal]\nhello")
+        self.assertEqual(eko.message_text(agent.messages[0]),
+                         '<input source="user-terminal">\nhello\n</input>')
         self.assertEqual(eko.message_text(agent.messages[1]), "finished<done/>")
         self.assertIn("You are Eko.", agent.model.system)
         self.stop(agent)
 
     def test_feral_agent_starts_without_a_prompt(self):
-        model = FakeModel(lambda *_: "```python-run\nimport time\ntime.sleep(60)\n```")
+        def reply(_message, cancelled):
+            return "stopped" if cancelled.is_set() else PythonCall(
+                "import time\ntime.sleep(60)\n")
+
+        model = FakeModel(reply)
         agent = eko.Eko(Path.cwd(), model, feral=True)
         agent.start()
-        wait_until(lambda: len(agent.messages) == 2)
+        wait_until(lambda: agent.state == "running Python")
 
         self.assertNotIn("Feral mode", model.system)
-        self.assertEqual(
-            eko.message_text(agent.messages[0]), "[harness]\nBegin."
-        )
-        self.stop(agent)
-
-    def test_context_notices_warn_then_reset_to_opening_input(self):
-        usages = iter((50_000, 90_000, 95_000, 96_000, 0))
-        model = None
-
-        def replies(message, _cancelled):
-            assert model is not None
-            model.context_used = next(usages)
-            if len(model.messages) == 5:
-                return "<done/>"
-            return "```python-run\npass\n```"
-
-        model = FakeModel(replies)
-        agent = eko.Eko(Path.cwd(), model, context=100_000)
-        agent.start("standing task")
-        wait_until(lambda: len(model.messages) == 5)
-        wait_until(lambda: agent.state == "idle")
-
-        self.assertEqual(model.messages[0], "standing task")
-        self.assertIn("[harness]\ncontext 50k/100k (50%)", model.messages[1])
-        self.assertIn("[harness]\ncontext 90k/100k (90%)", model.messages[2])
-        self.assertEqual(model.messages[3], eko.FAREWELL)
-        self.assertEqual(model.messages[4], "standing task")
-        self.assertEqual(model.resets, 1)
-        self.stop(agent)
-
-    def test_context_reset_is_disabled_by_default(self):
-        model = None
-
-        def replies(_message, _cancelled):
-            assert model is not None
-            model.context_used = 100_000
-            return ("```python-run\npass\n```" if len(model.messages) == 1
-                    else "<done/>")
-
-        model = FakeModel(replies)
-        agent = eko.Eko(Path.cwd(), model)
-        agent.start("standing task")
-        wait_until(lambda: agent.state == "idle")
-
-        self.assertEqual(len(model.messages), 2)
-        self.assertNotIn("context ", model.messages[1])
-        self.assertEqual(model.resets, 0)
+        self.assertEqual(model.messages[0], "Begin.")
         self.stop(agent)
 
     def test_terminal_input_is_limited_before_the_model(self):
@@ -488,6 +561,72 @@ class EkoTests(unittest.TestCase):
         self.assertEqual(ui.errors, ["Interrupted"])
         self.stop(agent)
 
+    def test_python_completion_returns_to_thinking_state(self):
+        def replies(message, _cancelled):
+            if message == "run":
+                return PythonCall("print('done')")
+            return "finished<done/>"
+
+        agent, ui = self.agent(replies)
+        agent.start("run")
+        wait_until(lambda: agent.state == "idle")
+        states = [event.value for event in ui.events if event.type == "state"]
+        running = states.index("running Python")
+        self.assertEqual(states[running + 1], "thinking")
+        self.stop(agent)
+
+    def test_interrupting_python_also_cancels_the_model_tool_loop(self):
+        calls = []
+
+        def replies(message, cancelled):
+            if message == "run":
+                return PythonCall(
+                    "import time\nwhile True: time.sleep(.1)\n")
+            calls.append(message)
+            if cancelled.is_set():
+                raise InterruptedError
+            return PythonCall("print('should not run')")
+
+        agent, ui = self.agent(replies)
+        agent.start("run")
+        wait_until(lambda: agent.state == "running Python")
+        agent.interrupt()
+        wait_until(lambda: agent.state == "idle")
+
+        states = [event.value for event in ui.events if event.type == "state"]
+        running = states.index("running Python")
+        self.assertNotIn("thinking", states[running + 1:])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Interrupted", calls[0])
+        self.assertEqual(ui.errors, ["Interrupted"])
+        self.stop(agent)
+
+    def test_input_during_interrupted_python_starts_the_next_clean_turn(self):
+        def replies(message, cancelled):
+            if message == "run":
+                return PythonCall(
+                    "import time\nwhile True: time.sleep(.1)\n")
+            if "Interrupted" in message:
+                raise InterruptedError
+            if message == "new request":
+                cancelled.clear()
+                return "recovered<done/>"
+            self.fail(f"unexpected model input: {message!r}")
+
+        agent, ui = self.agent(replies)
+        agent.start("run")
+        wait_until(lambda: agent.state == "running Python")
+        agent.send("new request")
+        agent.interrupt()
+        wait_until(lambda: agent.state == "idle")
+
+        self.assertEqual(agent.model.messages[-1], "new request")
+        self.assertEqual(ui.errors, ["Interrupted"])
+        responses = [event.value[0] for event in ui.events
+                     if event.type == "response" and event.value[1] is None]
+        self.assertIn("recovered<done/>", responses)
+        self.stop(agent)
+
     def test_model_error_does_not_kill_worker(self):
         def replies(message, cancelled):
             if message == "broken":
@@ -506,9 +645,10 @@ class EkoTests(unittest.TestCase):
     def test_python_output_precedes_input_received_during_execution(self):
         def replies(message, cancelled):
             if message == "run":
-                return "```python-run\nimport time\ntime.sleep(.2)\nprint('done')\n```"
+                return PythonCall("import time\ntime.sleep(.2)\nprint('done')\n")
             self.assertTrue(message.startswith("done\n"))
-            self.assertTrue(message.endswith("typed while running"))
+            self.assertIn('<input source="user-terminal">', message)
+            self.assertIn("typed while running", message)
             return "finished<done/>"
 
         agent, ui = self.agent(replies)
@@ -520,59 +660,14 @@ class EkoTests(unittest.TestCase):
         self.assertEqual(ui.results[0].output, "done\n")
         self.stop(agent)
 
-    def test_predicted_attribution_adds_a_harness_warning(self):
-        def replies(message, _cancelled):
-            if message == "start":
-                return ("```python-run\nprint('actual')\n```\n\n"
-                        "[python exit=0]\npredicted")
-            self.assertIn("actual", message)
-            self.assertIn("do not predict the contents", message)
-            return "<done/>"
-
-        agent, _ui = self.agent(replies)
-        agent.start("start")
-        wait_until(lambda: len(agent.model.messages) == 2)
-        self.stop(agent)
-
-    def test_malformed_predicted_attributions_add_a_harness_warning(self):
-        predictions = (
-            "user[python exit=0]\npredicted",
-            "user[harness] predicted guidance",
-            "[terminal] predicted input on the same line",
-            "<system-reminder>predicted reminder",
-        )
-        for prediction in predictions:
-            with self.subTest(prediction=prediction):
-                def replies(message, _cancelled):
-                    if message == "start":
-                        return f"```python-run\nprint('actual')\n```\n\n{prediction}"
-                    self.assertIn("do not predict the contents", message)
-                    return "<done/>"
-
-                agent, _ui = self.agent(replies)
-                agent.start("start")
-                wait_until(lambda: len(agent.model.messages) == 2)
-                self.stop(agent)
-
     def test_inputs_are_emitted_before_model_responses(self):
         agent, ui = self.agent(lambda _message, _cancelled: "<done/>")
         agent.start("hello")
         wait_until(lambda: agent.state == "idle")
         inputs = [event.value for event in ui.events if event.type == "input"]
         self.assertEqual(inputs, [eko.Message("user", (
-            eko.Text("[terminal]\n"), eko.Text("hello")))])
-        self.stop(agent)
-
-    def test_attribution_text_inside_executable_python_does_not_warn(self):
-        def replies(message, _cancelled):
-            if message == "start":
-                return "```python-run\nprint('[python exit=0]')\n```"
-            self.assertNotIn("do not predict the contents", message)
-            return "<done/>"
-
-        agent, _ui = self.agent(replies)
-        agent.start("start")
-        wait_until(lambda: len(agent.model.messages) == 2)
+            eko.Text('<input source="user-terminal">\n'), eko.Text("hello"),
+            eko.Text("\n</input>")))])
         self.stop(agent)
 
     def test_detached_python_can_send_attributed_input(self):
@@ -580,7 +675,7 @@ class EkoTests(unittest.TestCase):
 
         def replies(message, cancelled):
             if message == "start":
-                return """```python-run
+                return PythonCall("""
 import json, os, socket, subprocess, sys
 code = '''
 import json, os, socket, time
@@ -600,7 +695,7 @@ subprocess.Popen(
     start_new_session=True,
 )
 print("started")
-```"""
+""")
             if message.startswith("started"):
                 return "foreground turn finished<done/>"
             self.assertEqual(message, callback)
@@ -619,7 +714,7 @@ print("started")
 
         def replies(message, _cancelled):
             if message == "start":
-                return "```python-run\nimport os; print(os.environ['EKO_AGENT'])\n```"
+                return PythonCall("import os; print(os.environ['EKO_AGENT'])\n")
             self.assertEqual(message, expected)
             return "<done/>"
 
@@ -697,79 +792,15 @@ class RenderingTests(unittest.TestCase):
         Console(file=stream, force_terminal=False, width=80).print(renderable)
         return stream.getvalue()
 
-    def test_partial_python_fence_renders_inside_panel(self):
-        rendered = self.render(host.response_renderable(
-            "Looking.\n```python-run\nprint('still streaming')"))
-        self.assertIn("Looking.", rendered)
+    def test_native_python_call_renders_inside_panel(self):
+        rendered = self.render(host.python_renderable("print('running')"))
         self.assertIn("python", rendered)
-        self.assertIn("print('still streaming')", rendered)
+        self.assertIn("print('running')", rendered)
         self.assertIn("╭", rendered)
-
-    def test_native_stream_prints_each_complete_code_row_once(self):
-        output = []
-
-        class Sink:
-            _append = lambda self, text: output.append(text)
-            _render = lambda self, item: RenderingTests.render(self, item)
-
-        stream = host.NativeStream(Sink())
-        stream.feed("Starting.\n```python-")
-        stream.feed("run\nprint(0)\nprint")
-        stream.feed("(1)\n```\nDone.")
-        stream.finish()
-        rendered = "".join(output)
-        self.assertEqual(rendered.count("╭─ python"), 1)
-        self.assertEqual(rendered.count("print(0)"), 1)
-        self.assertEqual(rendered.count("print(1)"), 1)
-        self.assertEqual(rendered.count("╰"), 1)
-        self.assertIn("Starting.", rendered)
-        self.assertIn("Done.", rendered)
-
-    def test_backticks_inside_python_do_not_close_fence(self):
-        ticks = "`" * 3
-        response = (
-            f"{ticks}python-run\n"
-            f'print("inside: {ticks}python")\n'
-            f"{ticks}\nDone.")
-        self.assertEqual(
-            eko.executable_python(response),
-            f'print("inside: {ticks}python")\n')
-
-        output = []
-
-        class Sink:
-            _append = lambda self, text: output.append(text)
-            _render = lambda self, item: RenderingTests.render(self, item)
-
-        stream = host.NativeStream(Sink())
-        for chunk in (response[:12], response[12:25], response[25:]):
-            stream.feed(chunk)
-        stream.finish()
-        rendered = "".join(output)
-        self.assertEqual(rendered.count("╭─ python"), 1)
-        self.assertEqual(rendered.count("inside:"), 1)
-        self.assertIn("Done.", rendered)
-
-    def test_closing_fence_may_be_split_across_chunks(self):
-        output = []
-
-        class Sink:
-            _append = lambda self, text: output.append(text)
-            _render = lambda self, item: RenderingTests.render(self, item)
-
-        stream = host.NativeStream(Sink())
-        stream.feed("```python-run\nprint(1)\n`")
-        stream.feed("``\nAfter.")
-        stream.finish()
-        rendered = "".join(output)
-        self.assertEqual(rendered.count("print(1)"), 1)
-        self.assertNotIn("│ ```", rendered)
-        self.assertIn("After.", rendered)
 
     def test_py_fence_is_displayed_but_not_executed(self):
         response = "Example:\n```py\nprint('display only')\n```\n"
 
-        self.assertIsNone(eko.executable_python(response))
         stream = io.StringIO()
         Console(file=stream, force_terminal=True, color_system="truecolor",
                 width=80).print(host.response_renderable(response))
@@ -780,7 +811,6 @@ class RenderingTests(unittest.TestCase):
     def test_plain_python_fence_is_displayed_but_not_executed(self):
         response = "Example:\n```python\nprint('display only')\n```\n"
 
-        self.assertIsNone(eko.executable_python(response))
         self.assertIn("display only", self.render(host.response_renderable(response)))
 
     def test_stream_has_no_hidden_transport_tags(self):
@@ -818,25 +848,10 @@ class RenderingTests(unittest.TestCase):
         stream.feed("def answer():\n    return 42\n```")
         stream.finish()
         rendered = "".join(output)
-        self.assertIsNone(eko.executable_python(stream.text))
         self.assertNotIn("**formatted**", rendered)
         self.assertIn("formatted", rendered)
         self.assertEqual(rendered.count("def answer"), 1)
         self.assertEqual(rendered.count("return 42"), 1)
-
-    def test_code_row_uses_gold_only_for_its_border(self):
-        captured = []
-
-        class Sink:
-            _append = lambda self, text: None
-            _render = lambda self, item: captured.append(item.copy()) or ""
-
-        stream = host.NativeStream(Sink())
-        stream._code_line(host.RichText("ordinary_name"))
-        row = captured[0]
-        self.assertEqual(row.style, "")
-        self.assertEqual(row.plain[2:15], "ordinary_name")
-        self.assertTrue(any(span.style == host.GOLD for span in row.spans))
 
     def test_display_output_reports_omitted_lines(self):
         output = host.display_output("\n".join(f"line {i}" for i in range(50)))
@@ -1071,7 +1086,9 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("/opt/eko/bin/python", command)
         pythonpath = command.index("PYTHONPATH")
         self.assertEqual(command[pythonpath - 1], "--setenv")
-        self.assertTrue(command[pythonpath + 1].startswith("/opt/eko/"))
+        paths = command[pythonpath + 1].split(os.pathsep)
+        self.assertTrue(all(path.startswith("/opt/eko") for path in paths))
+        self.assertTrue(any(path.startswith("/opt/eko/") for path in paths))
 
     def test_world_relay_forwards_stream_without_interpreting_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1194,10 +1211,8 @@ print("DAEMONS", *(process.pid for process in processes))
                     if not line:  # An idle child agent.
                         return
                     json.loads(line)  # terminal input
-                    response = eko.Message(
-                        "assistant", (eko.Text(f"```python-run\n{code}```"),))
                     connection.sendall((json.dumps({
-                        "message": eko.encode_message(response),
+                        "tool_call": {"id": "cleanup", "code": code},
                     }) + "\n").encode())
                     json.loads(reader.readline())  # Python result
                     response = eko.Message("assistant", (eko.Text("<done/>"),))
@@ -1553,8 +1568,7 @@ class TerminalTests(unittest.TestCase):
             live_numbers = [int(number) for number in re.findall(
                 r"│ print\((\d+)\)", streaming)]
             self.assertGreaterEqual(len(live_numbers), 1)
-            self.assertGreaterEqual(max(live_numbers), 20)
-            self.assertIn("esc interrupt · enter send", streaming)
+            self.assertGreaterEqual(max(live_numbers), 90)
             streaming_history = tmux(
                 "capture-pane", "-p", "-t", "eko", "-S", "-500",
                 capture=True).stdout
@@ -1589,7 +1603,7 @@ class TerminalTests(unittest.TestCase):
                 capture=True).stdout
             self.assertIn("╭─ python ", screen)
             self.assertIn("VISIBLE_RESULT", screen)
-            self.assertIn("╯\nExit 0 ·", screen)
+            self.assertIn("╯\n\nExit 0 ·", screen)
             self.assertNotIn("✓ Exit", screen)
             self.assertIn("› history-1\n", screen)
             self.assertIn("Received: history-1\n", screen)
@@ -1615,24 +1629,6 @@ class DemoModel(FakeModel):
     def __init__(self):
         super().__init__(self.reply)
 
-    def send(self, message, write):
-        text = eko.message_text(message).split("\n", 1)[-1]
-        if text != "long code":
-            return super().send(message, write)
-        self.messages.append("long code")
-        self.cancelled.clear()
-        parts = ["Streaming a large block.\n```python-run\n"]
-        write(parts[0])
-        for number in range(100):
-            if self.cancelled.wait(.02):
-                raise InterruptedError
-            part = f"print({number})\n"
-            parts.append(part)
-            write(part)
-        parts.append("```")
-        write(parts[-1])
-        return eko.Message("assistant", (eko.Text("".join(parts)),))
-
     def reply(self, message, cancelled):
         cancelled.clear()
         if message == "slow":
@@ -1643,10 +1639,10 @@ class DemoModel(FakeModel):
         if message == "after interrupt":
             return "Recovered after interrupt.<done/>"
         if message == "run code":
-            return "Checking.\n```python-run\nprint('VISIBLE_RESULT')\n```"
-        if message == "complete long code":
+            return PythonCall("print('VISIBLE_RESULT')\n")
+        if message in {"complete long code", "long code"}:
             code = "".join(f"print({number})\n" for number in range(100))
-            return f"Completing a large block.\n```python-run\n{code}```"
+            return PythonCall(code)
         if message.startswith("VISIBLE_RESULT"):
             return "Finished.<done/>"
         return f"Received: {message}<done/>"
