@@ -310,6 +310,10 @@ class Eko:
                     reply = self.model.send(
                         message,
                         lambda text: self._emit(Event("delta", text)))
+                    if self.context:
+                        self._emit(Event("context", (
+                            getattr(self.model, "context_used", 0), self.context
+                        )))
                     if reply.role != "assistant":
                         raise ValueError("model must return an assistant message")
                     response = message_text(reply)
@@ -340,6 +344,7 @@ class Eko:
                             PYTHON, (Text(output),), result.returncode),)
                     if self.reset_pending:
                         self.model.reset(self.system)
+                        self._emit(Event("context", (0, self.context)))
                         self.messages.clear()
                         self.context_notice = 0
                         self.reset_pending = False

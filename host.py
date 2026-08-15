@@ -479,13 +479,15 @@ class NativeStream:
 class UI:
     """Commit completed messages above a small live composer."""
 
-    def __init__(self) -> None:
+    def __init__(self, context: int = 0) -> None:
         self.live = ""
         self.streamed_response = ""
         self.lock = threading.Lock()
         self.activity_stop: threading.Event | None = None
         self.activity_thread: threading.Thread | None = None
         self.status: Callable[[], str] = lambda: "idle"
+        self.context_capacity = context
+        self.context_used = 0
         self.on_submit: Callable[[str], None] = lambda text: None
         self.on_interrupt: Callable[[], None] = lambda: None
         self.on_exit: Callable[[], None] = lambda: None
@@ -566,6 +568,9 @@ class UI:
             elif event.type == "result":
                 self._stop_activity()
                 self.result(event.value)
+            elif event.type == "context":
+                self.context_used, self.context_capacity = map(int, event.value)
+                self.app.invalidate()
             elif event.type == "error":
                 self._stop_activity()
                 if stream is not None:
@@ -632,7 +637,9 @@ class UI:
         active = state.startswith(("thinking", "running"))
         hint = ("esc interrupt · enter send" if active else
                 "enter send · ctrl+d exit")
-        return [("class:status", f"  {hint}")]
+        context = (f" · {core.context_status_line(self.context_used, self.context_capacity)}"
+                   if self.context_capacity else "")
+        return [("class:status", f"  {hint}{context}")]
 
     def _render(self, renderable) -> str:
         stream = io.StringIO()
@@ -1113,7 +1120,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
                 while agent.proc.poll() is None:
                     time.sleep(.2)
                 return
-            ui = UI()
+            ui = UI(context=context)
             ui.header(cwd, model, name)
             ui.connect(agent)
             ui.on_exit = lambda: (agent.stop(), ui.exit())

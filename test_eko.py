@@ -91,6 +91,30 @@ class CoreTests(unittest.TestCase):
             "context 64k/128k (50%)",
         )
 
+    def test_context_usage_is_observable_when_enabled(self):
+        model = FakeModel(lambda *_: "<done/>")
+        model.context_used = 64_000
+        events = []
+        agent = eko.Eko(Path.cwd(), model, observer=events.append, context=128_000)
+        agent.start("hello")
+        wait_until(lambda: len(model.messages) == 1 and agent.state == "idle")
+
+        self.assertIn(eko.Event("context", (64_000, 128_000)), events)
+        agent.stop()
+        agent.wait(2)
+
+    def test_context_usage_is_not_observable_when_disabled(self):
+        model = FakeModel(lambda *_: "<done/>")
+        model.context_used = 64_000
+        events = []
+        agent = eko.Eko(Path.cwd(), model, observer=events.append)
+        agent.start("hello")
+        wait_until(lambda: len(model.messages) == 1 and agent.state == "idle")
+
+        self.assertFalse(any(event.type == "context" for event in events))
+        agent.stop()
+        agent.wait(2)
+
     def test_each_input_has_one_text_budget_across_all_of_its_parts(self):
         image = eko.Image("image/png", b"image")
         incoming = eko.Input(
@@ -574,6 +598,17 @@ print("started")
 
 
 class RenderingTests(unittest.TestCase):
+    def test_status_shows_context_only_when_enabled(self):
+        enabled = host.UI(context=128_000)
+        enabled.context_used = 64_000
+        disabled = host.UI()
+
+        self.assertEqual(
+            enabled._status()[0][1],
+            "  enter send · ctrl+d exit · context 64k/128k (50%)",
+        )
+        self.assertNotIn("context", disabled._status()[0][1])
+
     def test_python_execution_uses_the_original_running_activity_label(self):
         ui = host.UI.__new__(host.UI)
         labels = []
