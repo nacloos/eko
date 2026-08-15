@@ -968,6 +968,29 @@ class ModelTests(unittest.TestCase):
         self.assertIn("--model-socket", command)
         self.assertIn("--session-socket", command)
 
+    def test_sandbox_maps_only_external_package_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = root / "environment"
+            base = root / "base"
+            internal = environment / "lib/python3.12/site-packages"
+            external = root / "overlay/lib/python3.12/site-packages"
+            project = root / "project"
+            for path in (internal, external, project):
+                path.mkdir(parents=True)
+            with mock.patch.object(
+                sys, "path", [str(internal), str(external), str(project)]
+            ):
+                mounts, paths = host._package_mounts(environment, base)
+
+        self.assertEqual(mounts, [
+            "--ro-bind", str(external), "/opt/eko-packages/0"
+        ])
+        self.assertEqual(paths, [
+            "/opt/eko/lib/python3.12/site-packages",
+            "/opt/eko-packages/0",
+        ])
+
     def test_host_exports_model_socket_to_child_agents(self):
         observed = {}
 

@@ -20,7 +20,6 @@ import signal
 import socket
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import threading
 import time
@@ -791,6 +790,34 @@ def _mount_parents(path: Path) -> list[str]:
             for item in ("--dir", str(parent))]
 
 
+def _package_mounts(environment: Path, base: Path) -> tuple[list[str], list[str]]:
+    """Map active site-packages that live outside the sandbox environment."""
+    mounts: list[str] = []
+    paths: list[str] = []
+    seen: set[Path] = set()
+    external = 0
+    for value in sys.path:
+        path = Path(value).resolve()
+        if path in seen or path.name not in {"site-packages", "dist-packages"}:
+            continue
+        seen.add(path)
+        try:
+            relative = path.relative_to(environment)
+        except ValueError:
+            try:
+                path.relative_to(base)
+            except ValueError:
+                target = Path("/opt/eko-packages") / str(external)
+                external += 1
+                mounts.extend(("--ro-bind", str(path), str(target)))
+                paths.append(str(target))
+            else:
+                paths.append(str(path))
+        else:
+            paths.append(str(Path("/opt/eko") / relative))
+    return mounts, paths
+
+
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    feral: bool, name: str, context: int = 0,
                    clean_workspace: bool = False, model: str | None = None,
@@ -823,18 +850,7 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
     environment = Path(sys.prefix).resolve()
     interpreter = Path(sys.executable).resolve()
     base = interpreter.parents[1]
-    package_paths = []
-    for name in ("purelib", "platlib"):
-        path = Path(sysconfig.get_path(name)).resolve()
-        try:
-            relative = path.relative_to(environment)
-        except ValueError as error:
-            raise RuntimeError(
-                f"sandbox package directory is outside the environment: {path}"
-            ) from error
-        mapped = str(Path("/opt/eko") / relative)
-        if mapped not in package_paths:
-            package_paths.append(mapped)
+    package_mounts, package_paths = _package_mounts(environment, base)
     return [
         bwrap, "--die-with-parent", "--new-session", "--as-pid-1",
         "--clearenv", "--unshare-user", "--unshare-pid", "--unshare-ipc",
@@ -845,6 +861,7 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         "--dir", "/etc", "--ro-bind", "/etc/alternatives", "/etc/alternatives",
         *_mount_parents(base), "--ro-bind", str(base), str(base),
         "--ro-bind", str(environment), "/opt/eko", "--dir", "/run",
+        "--dir", "/opt/eko-packages", *package_mounts,
         "--ro-bind", str(source), "/run/eko.py",
         "--bind", str(cwd), "/workspace", "--bind", str(runtime), "/run/eko",
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
