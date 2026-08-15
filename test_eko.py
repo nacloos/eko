@@ -883,6 +883,66 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_tinker_trajectory_records_exact_tokens_logprobs_and_prompt(self):
+        class Chunk:
+            length = 2
+
+        class Prompt:
+            chunks = [Chunk()]
+
+            def model_dump(self, mode=None):
+                self.mode = mode
+                return {"chunks": [{"type": "encoded_text", "tokens": [10, 11]}]}
+
+        class Renderer:
+            def create_conversation_prefix_with_tools(self, _tools, _system):
+                return []
+
+            def build_generation_prompt(self, _messages, **_options):
+                return Prompt()
+
+            def get_stop_sequences(self):
+                return []
+
+            def parse_response(self, _tokens):
+                return {"role": "assistant", "content": "done"}, None
+
+        class Sequence:
+            tokens = [20, 21]
+            logprobs = [-0.2, -0.1]
+            stop_reason = "stop"
+
+        class Future:
+            def result(self, timeout=None):
+                return type("Response", (), {"sequences": [Sequence()]})()
+
+        class Client:
+            def get_base_model(self):
+                return "thinkingmachines/Inkling-Small"
+
+            def sample(self, *_args, **_kwargs):
+                return Future()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trajectory.jsonl"
+            model = models.Tinker(
+                Path.cwd(), client=Client(), renderer=Renderer(),
+                trajectory_path=path)
+            reply = model.complete(
+                "system", conversation("start")[0], lambda _text: None,
+                lambda _code: self.fail("unexpected Python call"))
+
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            transition, end = records
+            self.assertEqual(reply, eko.Message("assistant", (eko.Text("done"),)))
+            self.assertEqual(transition["action"]["tokens"], [20, 21])
+            self.assertEqual(transition["action"]["logprobs"], [-0.2, -0.1])
+            self.assertEqual(transition["observation"]["chunks"][0]["tokens"],
+                             [10, 11])
+            self.assertEqual(end["reason"], "completed")
+            self.assertEqual(end["final_observation"]["chunks"][0]["tokens"],
+                             [10, 11])
+
     def test_claude_process_exit_clears_python_broker_handler(self):
         model = host.Claude(Path.cwd(), "fake", "low")
 
@@ -952,6 +1012,16 @@ class ModelTests(unittest.TestCase):
         )
 
         self.assertIn("--clean-workspace", command)
+
+    def test_headless_observer_ignores_initial_idle_then_finishes(self):
+        observer = host.HeadlessObserver()
+        with mock.patch.object(host, "print_event"):
+            observer(eko.Event("state", "idle"))
+            self.assertFalse(observer.finished.is_set())
+            observer(eko.Event("state", "thinking"))
+            observer(eko.Event("state", "running Python"))
+            observer(eko.Event("state", "idle"))
+        self.assertTrue(observer.finished.is_set())
 
     def test_agent_startup_error_includes_child_stderr(self):
         agent = host.AgentProcess([

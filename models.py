@@ -24,6 +24,7 @@ RESUME_RETRIES = 3
 DEFAULT_MODEL = "thinkingmachines/Inkling-Small"
 SESSION_VERSION = 3
 EFFORT = {"low": .2, "medium": .7, "high": .9, "xhigh": .99, "max": .99}
+TRAJECTORY_WRITE_LOCK = threading.Lock()
 PYTHON_TOOL = {
     "name": "python",
     "description": "Run Python in the agent's workspace and return its result.",
@@ -113,7 +114,8 @@ class Tinker:
     def __init__(self, cwd: Path, model: str | None = None,
                  effort: str | None = None, session_id: str | None = None,
                  resume: bool = False, client: Any = None,
-                 renderer: Any = None) -> None:
+                 renderer: Any = None,
+                 trajectory_path: Path | None = None) -> None:
         self.cwd = cwd
         self.model = model or DEFAULT_MODEL
         self.effort = effort
@@ -131,8 +133,23 @@ class Tinker:
         self.messages: list[dict] = []
         self.interrupted = threading.Event()
         self.context_used = 0
+        configured_trajectory = os.environ.get("EKO_TRAJECTORY_PATH")
+        self.trajectory_path = (trajectory_path or
+            (Path(configured_trajectory) if configured_trajectory else None))
         if resume:
             self._load(model)
+
+    def _record_trajectory(self, value: dict) -> None:
+        """Append one exact sampling record without changing session semantics."""
+        if self.trajectory_path is None:
+            return
+        record = {"schema": "eko-tinker-trajectory-v1",
+                  "session_id": self.session_id, **value}
+        self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(record, separators=(",", ":")) + "\n"
+        with TRAJECTORY_WRITE_LOCK:
+            with self.trajectory_path.open("a", encoding="utf-8") as file:
+                file.write(encoded)
 
     def _load(self, requested_model: str | None) -> None:
         try:
@@ -248,17 +265,36 @@ class Tinker:
                     continue
             parsed, _termination = renderer.parse_response(
                 response.sequences[0].tokens)
+            sequence = response.sequences[0]
             assistant = dict(parsed)
             calls = assistant.get("tool_calls") or []
+            assistant["tool_calls"] = [
+                call.model_dump(mode="json") if hasattr(call, "model_dump") else call
+                for call in calls
+            ] if calls else []
+            self._record_trajectory({
+                "type": "transition",
+                "turn": turn_count,
+                "observation": prompt.model_dump(mode="json"),
+                "action": {
+                    "tokens": list(sequence.tokens),
+                    "logprobs": (None if sequence.logprobs is None
+                                   else list(sequence.logprobs)),
+                    "stop_reason": str(sequence.stop_reason),
+                },
+                "assistant": assistant,
+            })
             if not calls:
                 answer = self._text(assistant)
                 on_text(answer)
                 messages.append(assistant)
+                self._record_trajectory({
+                    "type": "episode_end", "reason": "completed",
+                    "turns": turn_count,
+                    "final_observation": renderer.build_generation_prompt(
+                        messages, **options).model_dump(mode="json"),
+                })
                 break
-            assistant["tool_calls"] = [
-                call.model_dump(mode="json") if hasattr(call, "model_dump") else call
-                for call in calls
-            ]
             messages.append(assistant)
             for call in calls:
                 if call.function.name != "python":
@@ -274,6 +310,12 @@ class Tinker:
                     "content": tinker_tool_content(result),
                 })
             if max_turns and turn_count >= max_turns:
+                self._record_trajectory({
+                    "type": "episode_end", "reason": "max_turns",
+                    "turns": turn_count,
+                    "final_observation": renderer.build_generation_prompt(
+                        messages, **options).model_dump(mode="json"),
+                })
                 self._save(messages)
                 self.messages = messages
                 self.context_used = sum(

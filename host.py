@@ -840,13 +840,31 @@ def print_event(event: core.Event) -> None:
         print(f"! {event.value}", file=sys.stderr, flush=True)
 
 
+class HeadlessObserver:
+    """Print agent events and detect idle after an autonomous work cycle."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.finished = threading.Event()
+
+    def __call__(self, event: core.Event) -> None:
+        print_event(event)
+        if event.type != "state":
+            return
+        if event.value == "idle":
+            if self.active:
+                self.finished.set()
+        else:
+            self.active = True
+
+
 def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         feral: bool, name: str, headless: bool, sandbox: bool,
         world_socket: Path | None = None, session_id: str | None = None,
         resume: bool = False, context: int = 0,
         clean_workspace: bool = False,
         python_timeout: float = core.PYTHON_TIMEOUT,
-        max_turns: int = 0) -> None:
+        max_turns: int = 0, exit_when_idle: bool = False) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -882,11 +900,13 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             if not agent.ready.wait(10) or agent.proc.poll() is not None:
                 raise RuntimeError(agent.startup_error())
             if headless:
-                agent.observer = print_event
+                observer = HeadlessObserver()
+                agent.observer = observer
                 print(f"EKO_SESSION={runtime / 'session.sock'}", flush=True)
                 if prompt:
                     agent.send(prompt)
-                while agent.proc.poll() is None:
+                while (agent.proc.poll() is None
+                       and not (exit_when_idle and observer.finished.is_set())):
                     time.sleep(.2)
                 return
             ui = UI(context=context)
@@ -932,6 +952,10 @@ def main() -> None:
     # Temporary experiment flag; remove after the workspace-hygiene evaluation.
     parser.add_argument("--clean-workspace", action="store_true")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--exit-when-idle", action="store_true",
+        help="in headless mode, exit after the first completed work cycle",
+    )
     parser.add_argument("--sandbox", action="store_true")
     parser.add_argument(
         "--feral", action="store_true",
@@ -953,6 +977,8 @@ def main() -> None:
         parser.error("--python-timeout must be greater than zero")
     if args.max_turns < 0:
         parser.error("--max-turns must not be negative")
+    if args.exit_when_idle and not args.headless:
+        parser.error("--exit-when-idle requires --headless")
 
     def launch(cwd: Path) -> None:
         run(cwd, args.prompt, model=args.model, effort=args.effort,
@@ -961,7 +987,8 @@ def main() -> None:
             session_id=args.session_id or args.resume,
             resume=args.resume is not None, context=args.context,
             clean_workspace=args.clean_workspace,
-            python_timeout=args.python_timeout, max_turns=args.max_turns)
+            python_timeout=args.python_timeout, max_turns=args.max_turns,
+            exit_when_idle=args.exit_when_idle)
 
     try:
         if args.feral and args.cwd is None:
