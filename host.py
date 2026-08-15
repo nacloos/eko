@@ -962,14 +962,15 @@ def _mount_parents(path: Path) -> list[str]:
 
 
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
-                   feral: bool, name: str) -> list[str]:
+                   feral: bool, name: str,
+                   python_timeout: float = core.PYTHON_TIMEOUT) -> list[str]:
     source = Path(core.__file__).resolve()
     arguments = ["--cwd", "/workspace" if sandbox else str(cwd),
                  "--model-socket",
                  "/run/eko/model.sock" if sandbox else str(runtime / "model.sock"),
                  "--session-socket",
                  "/run/eko/session.sock" if sandbox else str(runtime / "session.sock"),
-                 "--name", name]
+                 "--name", name, "--python-timeout", str(python_timeout)]
     if feral:
         arguments.append("--feral")
     if not sandbox:
@@ -1017,7 +1018,8 @@ def print_event(event: core.Event) -> None:
 
 
 def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
-        feral: bool, name: str, headless: bool, sandbox: bool) -> None:
+        feral: bool, name: str, headless: bool, sandbox: bool,
+        python_timeout: float = core.PYTHON_TIMEOUT) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -1038,7 +1040,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         environment["EKO_WORLD"] = str(runtime / "world.sock")
         agent = AgentProcess(
             _agent_command(
-                cwd, runtime, sandbox=sandbox, feral=feral, name=name
+                cwd, runtime, sandbox=sandbox, feral=feral, name=name,
+                python_timeout=python_timeout
             ),
             env=environment,
         )
@@ -1081,14 +1084,20 @@ def main() -> None:
     parser.add_argument("--model", default="claude-opus-5")
     parser.add_argument("--effort", default="high")
     parser.add_argument("--name", default=core.NAME)
+    parser.add_argument(
+        "--python-timeout", type=float, default=core.PYTHON_TIMEOUT,
+        help=f"maximum seconds per Python action (default: {core.PYTHON_TIMEOUT:g})",
+    )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--sandbox", action="store_true")
     parser.add_argument("--feral", action="store_true")
     args = parser.parse_args()
+    if args.python_timeout <= 0:
+        parser.error("--python-timeout must be greater than zero")
     try:
         run(args.cwd, args.prompt, model=args.model, effort=args.effort,
             feral=args.feral, name=args.name, headless=args.headless,
-            sandbox=args.sandbox)
+            sandbox=args.sandbox, python_timeout=args.python_timeout)
     except (RuntimeError, ValueError) as error:
         parser.error(str(error))
 

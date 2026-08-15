@@ -77,6 +77,18 @@ class FakeModel:
 
 
 class CoreTests(unittest.TestCase):
+    def test_python_actions_default_to_thirty_seconds(self):
+        agent = eko.Eko(Path.cwd(), FakeModel(lambda *_: "<done/>"))
+        self.assertEqual(agent.python_timeout, 30)
+
+    def test_python_action_timeout_is_configurable(self):
+        result = eko._run_python(
+            "import time; time.sleep(10)", Path.cwd(), threading.Event(),
+            timeout=.01,
+        )
+        self.assertIn("TIMEOUT after 0.01s", result.output)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_each_input_has_one_text_budget_across_all_of_its_parts(self):
         image = eko.Image("image/png", b"image")
         incoming = eko.Input(
@@ -661,6 +673,14 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_agent_command_forwards_python_timeout(self):
+        command = host._agent_command(
+            Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,
+            name="Eko", python_timeout=12.5,
+        )
+        index = command.index("--python-timeout")
+        self.assertEqual(command[index + 1], "12.5")
+
     def test_identity_is_configurable_and_location_is_neutral(self):
         prompt = eko.SYSTEM.format(name="Moa", folder="/workspace", mode="")
         self.assertTrue(prompt.startswith("You are Moa.\nYou are in /workspace.\n"))

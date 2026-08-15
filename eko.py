@@ -78,7 +78,7 @@ FERAL_NUDGE = "Write a fenced ```python-run block."
 NORMAL_MODE = (" If no action is needed, answer directly. When the prompt is "
                "fully resolved, end with <done/> and no Python block.")
 MAX_INPUT_TEXT = 20_000
-TIMEOUT = 600
+PYTHON_TIMEOUT = 30.0
 MAX_MESSAGE = 16 * 1024 * 1024
 MAX_IMAGE = 5 * 1024 * 1024
 MAX_IMAGES = 20
@@ -158,11 +158,13 @@ class Eko:
     def __init__(self, cwd: Path, model, feral: bool = False,
                  socket_path: Path | None = None,
                  observer: Callable[[Event], None] | None = None,
-                 name: str = NAME) -> None:
+                 name: str = NAME,
+                 python_timeout: float = PYTHON_TIMEOUT) -> None:
         self.cwd = cwd.resolve()
         self.feral = feral
         self.observer = observer or (lambda _event: None)
         self.model = model
+        self.python_timeout = python_timeout
         mode = "" if feral else NORMAL_MODE
         self.system = SYSTEM.format(
             name=name, folder=self.cwd, mode=mode)
@@ -280,7 +282,9 @@ class Eko:
         env = os.environ.copy()
         env["EKO_SESSION"] = str(self.socket_path)
         env["EKO_AGENT"] = str(Path(__file__).resolve())
-        return _run_python(code, self.cwd, self.interrupted, env=env)
+        env["EKO_PYTHON_TIMEOUT"] = str(self.python_timeout)
+        return _run_python(
+            code, self.cwd, self.interrupted, timeout=self.python_timeout, env=env)
 
     def _run(self) -> None:
         """Alternate attributed inputs, model responses, and Python execution."""
@@ -549,6 +553,7 @@ def message_text(message: Message) -> str:
 # ── Python execution ─────────────────────────────────────────────────────────
 
 def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
+               timeout: float = PYTHON_TIMEOUT,
                env: dict[str, str] | None = None) -> Result:
     """Run one model-written Python block in the persistent working folder."""
     python = cwd / ".venv/bin/python"
@@ -561,7 +566,7 @@ def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
             errors="replace", start_new_session=True, env=env)
         ACTIVE_CHILDREN.add(proc.pid)
     try:
-        deadline = started + TIMEOUT
+        deadline = started + timeout
         while True:
             try:
                 output, _ = proc.communicate(timeout=.1)
@@ -571,7 +576,7 @@ def _run_python(code: str, cwd: Path, interrupted: threading.Event, *,
                     os.killpg(proc.pid, signal.SIGKILL)
                     output, _ = proc.communicate()
                     reason = ("Interrupted" if interrupted.is_set()
-                              else f"TIMEOUT after {TIMEOUT}s")
+                              else f"TIMEOUT after {timeout:g}s")
                     output += f"\n{reason}"
                     break
     finally:
@@ -737,7 +742,8 @@ def decode_event(raw: dict) -> Event:
 
 def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           feral: bool = False, name: str = NAME,
-          socket_path: Path | None = None) -> None:
+          socket_path: Path | None = None,
+          python_timeout: float = PYTHON_TIMEOUT) -> None:
     """Run the agent using JSON-lines stdin, stdout, and model socket."""
     if os.getpid() == 1:
         threading.Thread(target=_reap_children, daemon=True).start()
@@ -751,7 +757,8 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
 
     agent = Eko(
         cwd, Model(model_socket), feral, socket_path=socket_path,
-        observer=lambda event: write(encode_event(event)), name=name)
+        observer=lambda event: write(encode_event(event)), name=name,
+        python_timeout=python_timeout)
     agent.start(prompt)
     write({"type": "ready", "session": str(agent.socket_path)})
     try:
@@ -790,14 +797,22 @@ def main() -> None:
     parser.add_argument("--session-socket", type=Path)
     parser.add_argument("--name", default=NAME)
     parser.add_argument("--feral", action="store_true")
+    parser.add_argument(
+        "--python-timeout", type=float,
+        default=float(os.environ.get("EKO_PYTHON_TIMEOUT", PYTHON_TIMEOUT)),
+        help=f"maximum seconds per Python action (default: {PYTHON_TIMEOUT:g})",
+    )
     args = parser.parse_args()
+    if args.python_timeout <= 0:
+        parser.error("--python-timeout must be greater than zero")
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
         parser.error(f"not a directory: {cwd}")
     if args.model_socket is None:
         parser.error("no model service; set EKO_MODEL")
     serve(cwd, args.model_socket, prompt=args.prompt, feral=args.feral,
-          name=args.name, socket_path=args.session_socket)
+          name=args.name, socket_path=args.session_socket,
+          python_timeout=args.python_timeout)
 
 
 if __name__ == "__main__":

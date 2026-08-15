@@ -36,6 +36,9 @@ Or give it a working folder and an initial prompt:
 uv run eko.py --cwd ~/projects/my-project "Find and fix a bug"
 ```
 
+Python actions time out after 30 seconds by default. Override this with
+`--python-timeout SECONDS`.
+
 Feral mode removes the completion state and keeps Eko acting until you interrupt
 it with Escape:
 
