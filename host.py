@@ -846,21 +846,28 @@ def _model_client(connection: socket.socket, cwd: Path,
 
     try:
         with connection, connection.makefile("rb") as reader:
-            initial = json.loads(reader.readline())
-            system = initial.get("system")
-            if not isinstance(system, str):
-                raise ValueError("first model event must contain system")
-            while line := reader.readline():
-                request = json.loads(line)
-                if request.get("interrupt") is True:
-                    claude.interrupt()
-                elif (isinstance(request.get("message"), dict) and
-                      (active is None or not active.is_alive())):
-                    active = threading.Thread(
-                        target=complete, args=(request["message"],), daemon=True)
-                    active.start()
-                else:
-                    send({"error": "model generation already active"})
+            try:
+                initial = json.loads(reader.readline())
+                if not isinstance(initial, dict):
+                    return
+                system = initial.get("system")
+                if not isinstance(system, str):
+                    return
+                while line := reader.readline():
+                    request = json.loads(line)
+                    if not isinstance(request, dict):
+                        return
+                    if request.get("interrupt") is True:
+                        claude.interrupt()
+                    elif (isinstance(request.get("message"), dict) and
+                          (active is None or not active.is_alive())):
+                        active = threading.Thread(
+                            target=complete, args=(request["message"],), daemon=True)
+                        active.start()
+                    else:
+                        send({"error": "model generation already active"})
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
     finally:
         claude.interrupt()
         if active is not None:

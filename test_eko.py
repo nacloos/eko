@@ -164,6 +164,22 @@ class CoreTests(unittest.TestCase):
 
 
 class ModelSocketTests(unittest.TestCase):
+    def test_malformed_model_events_close_the_connection(self):
+        payloads = (
+            b"", b"\n", b"null\n", b"{}\n",
+            b'{"system":"test"}\ninvalid\n',
+            b'{"system":"test"}\n[]\n',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                server, client = socket.socketpair()
+                client.sendall(payload)
+                client.shutdown(socket.SHUT_WR)
+                model = FakeModel(lambda text, _cancelled: text)
+                with mock.patch.object(host, "Claude", return_value=model):
+                    host._model_client(server, Path.cwd(), "fake", "low")
+                client.close()
+
     def test_model_connection_streams_and_returns_messages(self):
         with tempfile.TemporaryDirectory() as directory:
             endpoint = Path(directory) / "model.sock"
