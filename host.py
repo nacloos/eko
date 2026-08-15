@@ -899,6 +899,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         if relay is not None:
             relay.start()
         environment = os.environ.copy()
+        environment["EKO_MODEL"] = str(runtime / "model.sock")
         environment["EKO_WORLD"] = str(runtime / "world.sock")
         agent = AgentProcess(
             _agent_command(

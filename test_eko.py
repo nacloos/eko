@@ -968,6 +968,42 @@ class ModelTests(unittest.TestCase):
         self.assertIn("--model-socket", command)
         self.assertIn("--session-socket", command)
 
+    def test_host_exports_model_socket_to_child_agents(self):
+        observed = {}
+
+        class Server:
+            def __init__(self, path, *_args):
+                observed["socket"] = str(path)
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+        class Agent:
+            def __init__(self, _command, env):
+                observed["environment"] = env
+                self.ready = threading.Event()
+                self.ready.set()
+                self.proc = mock.Mock()
+                self.proc.poll.side_effect = [None, 0]
+                self.observer = None
+
+            def stop(self):
+                pass
+
+        with (
+            mock.patch.object(host, "ensure_claude_auth"),
+            mock.patch.object(host, "ModelServer", Server),
+            mock.patch.object(host, "AgentProcess", Agent),
+        ):
+            host.run(Path.cwd(), None, model="claude-fake", effort="low",
+                     feral=False, name="Eko", headless=True, sandbox=False)
+
+        self.assertEqual(observed["environment"]["EKO_MODEL"],
+                         observed["socket"])
+
     def test_sandbox_exposes_default_world_socket_path(self):
         with tempfile.TemporaryDirectory() as directory:
             command = host._agent_command(
