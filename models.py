@@ -293,21 +293,25 @@ class Claude:
 
     def _terminate(self, signum: int, grace: float = 2) -> None:
         """Signal the CLI process group and ensure it is collected."""
-        if self.proc is None:
+        proc = self.proc
+        if proc is None:
             return
-        if self.proc.poll() is None:
+        if proc.poll() is None:
             try:
-                os.killpg(self.proc.pid, signum)
+                os.killpg(proc.pid, signum)
             except ProcessLookupError:
                 pass
             try:
-                self.proc.wait(timeout=grace)
+                proc.wait(timeout=grace)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                self.proc.wait()
+                proc.wait()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
         self.proc = None
 
     def complete(self, system: str, message: core.Message,

@@ -1304,6 +1304,21 @@ print("DAEMONS", *(process.pid for process in processes))
         self.assertTrue(stdout.closed)
         self.assertIsNone(model.proc)
 
+    def test_interrupt_closes_claude_process_streams(self):
+        model = host.Claude(Path.cwd(), "fake", "low")
+        model.proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, start_new_session=True)
+        process = model.proc
+
+        model.interrupt()
+
+        self.assertIsNone(model.proc)
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+
     def test_exact_empty_text_resume_error_repairs_only_its_assistant_block(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "projects" / "project"
