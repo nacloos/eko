@@ -86,6 +86,20 @@ class FakeModel:
 
 
 class CoreTests(unittest.TestCase):
+    def test_python_actions_default_to_thirty_seconds(self):
+        agent = eko.Eko(Path.cwd(), FakeModel(lambda *_: "<done/>"))
+
+        self.assertEqual(agent.python_timeout, 30)
+
+    def test_python_action_timeout_is_configurable(self):
+        result = eko._run_python(
+            "import time; time.sleep(10)", Path.cwd(), threading.Event(),
+            timeout=.01,
+        )
+
+        self.assertIn("TIMEOUT after 0.01s", result.output)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_clean_workspace_guidance_is_opt_in(self):
         plain = eko.Eko(Path.cwd(), FakeModel(lambda *_: "<done/>"))
         clean = eko.Eko(
@@ -843,6 +857,15 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_agent_command_forwards_python_timeout(self):
+        command = host._agent_command(
+            Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,
+            name="Eko", python_timeout=12.5,
+        )
+
+        index = command.index("--python-timeout")
+        self.assertEqual(command[index + 1], "12.5")
+
     def test_agent_command_forwards_clean_workspace_flag(self):
         command = host._agent_command(
             Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,
