@@ -79,6 +79,7 @@ NUDGE = "Write a fenced ```python-run block, or <done/> if the prompt is resolve
 FERAL_NUDGE = "Write a fenced ```python-run block."
 NORMAL_MODE = (" If no action is needed, answer directly. When the prompt is "
                "fully resolved, end with <done/> and no Python block.")
+CLEAN_WORKSPACE = "Keep your workspace clean and organized."
 FAREWELL = "Final turn before reset."
 CONTEXT_NOTICES = (.50, .90)
 RESET_AT = .95
@@ -163,7 +164,8 @@ class Eko:
     def __init__(self, cwd: Path, model, feral: bool = False,
                  socket_path: Path | None = None,
                  observer: Callable[[Event], None] | None = None,
-                 name: str = NAME, context: int = 0) -> None:
+                 name: str = NAME, context: int = 0,
+                 clean_workspace: bool = False) -> None:
         self.cwd = cwd.resolve()
         self.feral = feral
         self.observer = observer or (lambda _event: None)
@@ -171,6 +173,8 @@ class Eko:
         mode = "" if feral else NORMAL_MODE
         self.system = SYSTEM.format(
             name=name, folder=self.cwd, mode=mode)
+        if clean_workspace:
+            self.system += f"\n{CLEAN_WORKSPACE}\n"
         self.messages: list[Message] = []
         self.context = context
         self.context_notice = 0
@@ -803,7 +807,8 @@ def decode_event(raw: dict) -> Event:
 
 def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           feral: bool = False, name: str = NAME,
-          socket_path: Path | None = None, context: int = 0) -> None:
+          socket_path: Path | None = None, context: int = 0,
+          clean_workspace: bool = False) -> None:
     """Run the agent using JSON-lines stdin, stdout, and model socket."""
     if os.getpid() == 1:
         threading.Thread(target=_reap_children, daemon=True).start()
@@ -818,7 +823,7 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
     agent = Eko(
         cwd, Model(model_socket), feral, socket_path=socket_path,
         observer=lambda event: write(encode_event(event)), name=name,
-        context=context)
+        context=context, clean_workspace=clean_workspace)
     agent.start(prompt)
     write({"type": "ready", "session": str(agent.socket_path)})
     try:
@@ -858,6 +863,8 @@ def main() -> None:
     parser.add_argument("--name", default=NAME)
     parser.add_argument("--feral", action="store_true")
     parser.add_argument("--context", type=int, default=0)
+    # Temporary experiment flag; remove after the workspace-hygiene evaluation.
+    parser.add_argument("--clean-workspace", action="store_true")
     args = parser.parse_args()
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
@@ -865,7 +872,8 @@ def main() -> None:
     if args.model_socket is None:
         parser.error("no model service; set EKO_MODEL")
     serve(cwd, args.model_socket, prompt=args.prompt, feral=args.feral,
-          name=args.name, socket_path=args.session_socket, context=args.context)
+          name=args.name, socket_path=args.session_socket, context=args.context,
+          clean_workspace=args.clean_workspace)
 
 
 if __name__ == "__main__":

@@ -1007,7 +1007,8 @@ def _mount_parents(path: Path) -> list[str]:
 
 
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
-                   feral: bool, name: str, context: int = 0) -> list[str]:
+                   feral: bool, name: str, context: int = 0,
+                   clean_workspace: bool = False) -> list[str]:
     source = Path(core.__file__).resolve()
     arguments = ["--cwd", "/workspace" if sandbox else str(cwd),
                  "--model-socket",
@@ -1017,6 +1018,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                  "--name", name]
     if context:
         arguments.extend(("--context", str(context)))
+    if clean_workspace:
+        arguments.append("--clean-workspace")
     if feral:
         arguments.append("--feral")
     if not sandbox:
@@ -1081,7 +1084,8 @@ def print_event(event: core.Event) -> None:
 def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         feral: bool, name: str, headless: bool, sandbox: bool,
         world_socket: Path | None = None, session_id: str | None = None,
-        resume: bool = False, context: int = 0) -> None:
+        resume: bool = False, context: int = 0,
+        clean_workspace: bool = False) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -1105,7 +1109,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         agent = AgentProcess(
             _agent_command(
                 cwd, runtime, sandbox=sandbox, feral=feral, name=name,
-                context=context
+                context=context, clean_workspace=clean_workspace
             ),
             env=environment,
         )
@@ -1152,6 +1156,8 @@ def main() -> None:
     parser.add_argument("--effort", default="high")
     parser.add_argument("--name", default=core.NAME)
     parser.add_argument("--context", type=int, default=0)
+    # Temporary experiment flag; remove after the workspace-hygiene evaluation.
+    parser.add_argument("--clean-workspace", action="store_true")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--sandbox", action="store_true")
     parser.add_argument(
@@ -1176,7 +1182,8 @@ def main() -> None:
             feral=args.feral, name=args.name, headless=args.headless,
             sandbox=args.sandbox, world_socket=args.world_socket,
             session_id=args.session_id or args.resume,
-            resume=args.resume is not None, context=args.context)
+            resume=args.resume is not None, context=args.context,
+            clean_workspace=args.clean_workspace)
 
     try:
         if args.feral and args.cwd is None:

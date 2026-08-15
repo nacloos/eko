@@ -85,6 +85,15 @@ class FakeModel:
 
 
 class CoreTests(unittest.TestCase):
+    def test_clean_workspace_guidance_is_opt_in(self):
+        plain = eko.Eko(Path.cwd(), FakeModel(lambda *_: "<done/>"))
+        clean = eko.Eko(
+            Path.cwd(), FakeModel(lambda *_: "<done/>"), clean_workspace=True
+        )
+
+        self.assertNotIn(eko.CLEAN_WORKSPACE, plain.system)
+        self.assertIn(eko.CLEAN_WORKSPACE, clean.system)
+
     def test_context_status_line_is_not_a_provenance_header(self):
         self.assertEqual(
             eko.context_status_line(64_000, 128_000),
@@ -786,6 +795,14 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_agent_command_forwards_clean_workspace_flag(self):
+        command = host._agent_command(
+            Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,
+            name="Eko", clean_workspace=True,
+        )
+
+        self.assertIn("--clean-workspace", command)
+
     def test_agent_startup_error_includes_child_stderr(self):
         agent = host.AgentProcess([
             sys.executable, "-c",
