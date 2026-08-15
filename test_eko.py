@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -398,6 +399,70 @@ class ModelSocketTests(unittest.TestCase):
 
 
 class ProcessInterfaceTests(unittest.TestCase):
+    def test_host_can_manage_a_process_through_agent_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            endpoint = root / "model.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(endpoint)); listener.listen()
+            agent = host.AgentProcess([
+                sys.executable, str(Path(eko.__file__).resolve()),
+                "--cwd", str(root), "--model-socket", str(endpoint),
+            ])
+            try:
+                self.assertTrue(agent.ready.wait(5), agent.startup_error())
+                process_id = agent.start_process([
+                    sys.executable, "-c",
+                    "from pathlib import Path; import time; "
+                    "Path('started').write_text('yes'); time.sleep(30)",
+                ], stdout="process.log")
+                wait_until(lambda: (root / "started").exists(), timeout=5)
+                self.assertIsNone(agent.process_status(process_id))
+                escaped = f"../escaped-{root.name}.log"
+                with self.assertRaisesRegex(RuntimeError, "inside the workspace"):
+                    agent.start_process(
+                        [sys.executable, "-c", "print('no')"],
+                        stdout=escaped,
+                    )
+                self.assertFalse((root.parent / Path(escaped).name).exists())
+                agent.signal_process(process_id, signal.SIGTERM)
+                wait_until(lambda: agent.process_status(process_id) is not None,
+                           timeout=5)
+            finally:
+                agent.stop()
+                listener.close()
+
+    @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is unavailable")
+    def test_managed_process_runs_inside_the_existing_sandbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            runtime = root / "runtime"
+            workspace.mkdir(); runtime.mkdir()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(runtime / "model.sock")); listener.listen()
+            agent = host.AgentProcess(host._agent_command(
+                workspace, runtime, sandbox=True, feral=False, name="Eko"))
+            try:
+                self.assertTrue(agent.ready.wait(10), agent.startup_error())
+                process_id = agent.start_process([
+                    "python", "-c",
+                    "import os; from pathlib import Path; "
+                    "Path('sandbox.json').write_text(__import__('json').dumps({"
+                    "'cwd': os.getcwd(), 'world': os.environ['EKO_WORLD'], "
+                    "'session': os.environ['EKO_SESSION']}))",
+                ])
+                time.sleep(.5)  # Let the sandbox PID-1 reaper observe the child.
+                wait_until(lambda: agent.process_status(process_id) is not None,
+                           timeout=10)
+                details = json.loads((workspace / "sandbox.json").read_text())
+                self.assertEqual(details["cwd"], "/workspace")
+                self.assertEqual(details["world"], "/run/eko/world.sock")
+                self.assertTrue(details["session"].startswith("/run/eko/"))
+            finally:
+                agent.stop()
+                listener.close()
+
     def test_child_does_not_reuse_inherited_parent_session(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -944,6 +1009,74 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(end["final_observation"]["chunks"][0]["tokens"],
                              [10, 11])
 
+    def test_tinker_malformed_python_call_ends_at_turn_limit(self):
+        class Chunk:
+            length = 1
+
+        class Prompt:
+            chunks = [Chunk()]
+
+            def model_dump(self, mode=None):
+                return {"chunks": [{"type": "encoded_text", "tokens": [10]}]}
+
+        class Function:
+            name = "python"
+            arguments = json.dumps({"command": "ls"})
+
+        class Call:
+            id = "call-1"
+            function = Function()
+
+            def model_dump(self, mode=None):
+                return {"type": "function", "id": self.id,
+                        "function": {"name": self.function.name,
+                                     "arguments": self.function.arguments}}
+
+        class Renderer:
+            def create_conversation_prefix_with_tools(self, _tools, _system):
+                return []
+
+            def build_generation_prompt(self, _messages, **_options):
+                return Prompt()
+
+            def get_stop_sequences(self):
+                return []
+
+            def parse_response(self, _tokens):
+                return {"role": "assistant", "content": "",
+                        "tool_calls": [Call()]}, None
+
+        class Sequence:
+            tokens = [20]
+            logprobs = [-.1]
+            stop_reason = "stop"
+
+        class Future:
+            def result(self, timeout=None):
+                return type("Response", (), {"sequences": [Sequence()]})()
+
+        class Client:
+            def get_base_model(self):
+                return "thinkingmachines/Inkling-Small"
+
+            def sample(self, *_args, **_kwargs):
+                return Future()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trajectory.jsonl"
+            model = models.Tinker(
+                Path.cwd(), client=Client(), renderer=Renderer(),
+                trajectory_path=path)
+            reply = model.complete(
+                "system", conversation("start")[0], lambda _text: None,
+                lambda _code: self.fail("malformed call must not execute"),
+                max_turns=1)
+
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(reply, eko.Message("assistant", ()))
+            self.assertEqual(records[-1]["type"], "episode_end")
+            self.assertEqual(records[-1]["reason"], "max_turns")
+
     def test_claude_process_exit_clears_python_broker_handler(self):
         model = host.Claude(Path.cwd(), "fake", "low")
 
@@ -1013,26 +1146,6 @@ class ModelTests(unittest.TestCase):
         )
 
         self.assertIn("--clean-workspace", command)
-
-    def test_agent_command_maps_workspace_worker_into_sandbox(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            worker = cwd / "jobs" / "worker.py"
-            command = host._agent_command(
-                cwd, Path("/tmp/runtime"), sandbox=True, feral=False,
-                name="Eko", worker=worker,
-            )
-
-        index = command.index("--worker")
-        self.assertEqual(command[index + 1], "/workspace/jobs/worker.py")
-
-    def test_agent_command_rejects_worker_outside_workspace(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "inside the workspace"):
-                host._agent_command(
-                    Path(directory), Path("/tmp/runtime"), sandbox=False,
-                    feral=False, name="Eko", worker=Path("/tmp/worker.py"),
-                )
 
     def test_standard_readonly_bind_mount_is_forwarded_to_sandbox(self):
         with tempfile.TemporaryDirectory() as directory:

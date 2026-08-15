@@ -848,19 +848,11 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           effort: str | None = None, session_id: str | None = None,
           resume: bool = False,
           python_timeout: float = PYTHON_TIMEOUT,
-          max_turns: int = 0, worker: Path | None = None) -> None:
+          max_turns: int = 0) -> None:
     """Run the agent using JSON-lines stdin, stdout, and model socket."""
     if os.getpid() == 1:
         threading.Thread(target=_reap_children, daemon=True).start()
     cwd = cwd.resolve()
-    if worker is not None:
-        worker = worker.resolve()
-        try:
-            worker.relative_to(cwd)
-        except ValueError as error:
-            raise ValueError("worker must be inside the workspace") from error
-        if not worker.is_file():
-            raise ValueError(f"worker does not exist: {worker}")
     write_lock = threading.Lock()
 
     def write(value: dict) -> None:
@@ -876,20 +868,85 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
         observer=lambda event: write(encode_event(event)), name=name,
         context=context, clean_workspace=clean_workspace,
         python_timeout=python_timeout, max_turns=max_turns)
-    worker_process = None
-    if worker is not None:
-        worker_environment = dict(os.environ)
-        worker_environment["EKO_SESSION"] = str(agent.socket_path)
-        worker_process = subprocess.Popen(
-            [sys.executable, str(worker)], cwd=cwd, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, env=worker_environment)
+    processes: dict[str, tuple[subprocess.Popen, object | None]] = {}
+
+    def workspace_path(value: str | None, default: Path) -> Path:
+        path = default if value is None else Path(value)
+        path = (path if path.is_absolute() else cwd / path).resolve()
+        try:
+            path.relative_to(cwd)
+        except ValueError as error:
+            raise ValueError("process paths must be inside the workspace") from error
+        return path
+
+    def process_command(message: dict) -> dict:
+        kind = message["type"]
+        request_id = message.get("request_id")
+        if kind == "process.start":
+            argv = message.get("argv")
+            if (not isinstance(argv, list) or not argv
+                    or not all(isinstance(value, str) and value for value in argv)):
+                raise ValueError("argv must be a non-empty list of strings")
+            process_cwd = workspace_path(message.get("cwd"), cwd)
+            if not process_cwd.is_dir():
+                raise ValueError("process cwd is not a directory")
+            output = None
+            output_path = message.get("stdout")
+            if output_path is not None:
+                if not isinstance(output_path, str) or not output_path:
+                    raise ValueError("stdout must be a workspace-relative path")
+                destination = workspace_path(output_path, cwd)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                output = destination.open("a")
+            environment = dict(os.environ, EKO_SESSION=str(agent.socket_path))
+            try:
+                with CHILDREN_LOCK:
+                    process = subprocess.Popen(
+                        argv, cwd=process_cwd, stdin=subprocess.DEVNULL,
+                        stdout=output or subprocess.DEVNULL,
+                        stderr=(subprocess.STDOUT if output
+                                else subprocess.DEVNULL),
+                        start_new_session=True, env=environment)
+                    ACTIVE_CHILDREN.add(process.pid)
+            except Exception:
+                if output is not None:
+                    output.close()
+                raise
+            process_id = uuid.uuid4().hex
+            processes[process_id] = (process, output)
+            return {"type": "process.started", "request_id": request_id,
+                    "process_id": process_id, "pid": process.pid}
+        process_id = message.get("process_id")
+        if process_id not in processes:
+            raise ValueError("unknown process")
+        process, output = processes[process_id]
+        if kind == "process.status":
+            returncode = process.poll()
+            if returncode is not None:
+                with CHILDREN_LOCK:
+                    ACTIVE_CHILDREN.discard(process.pid)
+                if output is not None:
+                    output.close()
+                    processes[process_id] = (process, None)
+            return {"type": "process.status", "request_id": request_id,
+                    "process_id": process_id, "returncode": returncode}
+        if kind == "process.signal":
+            signum = message.get("signal")
+            if not isinstance(signum, int) or signum <= 0:
+                raise ValueError("signal must be a positive integer")
+            if process.poll() is None:
+                os.killpg(process.pid, signum)
+            return {"type": "process.signaled", "request_id": request_id,
+                    "process_id": process_id}
+        raise ValueError("unsupported process command")
     try:
         agent.start(prompt)
         write({"type": "ready", "session": str(agent.socket_path)})
         for line in sys.stdin:
+            request_id = None
             try:
                 message = json.loads(line)
+                request_id = message.get("request_id")
                 kind = message.get("type")
                 if kind == "input":
                     agent.send(decode_input(message, TERMINAL, cwd))
@@ -897,22 +954,40 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
                     agent.interrupt()
                 elif kind == "stop":
                     break
+                elif kind in {"process.start", "process.status", "process.signal"}:
+                    write(process_command(message))
                 else:
                     raise ValueError("unsupported command")
             except Exception as error:
-                write({"type": "error", "value": f"Command rejected: {error}"})
+                response = {"type": "error",
+                            "value": f"Command rejected: {error}"}
+                if request_id is not None:
+                    response["request_id"] = request_id
+                write(response)
     except KeyboardInterrupt:
         agent.interrupt()
     finally:
         agent.stop()
         agent.wait(5)
-        if worker_process is not None and worker_process.poll() is None:
-            worker_process.terminate()
+        for process, output in processes.values():
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        for process, output in processes.values():
             try:
-                worker_process.wait(2)
+                process.wait(2)
             except subprocess.TimeoutExpired:
-                worker_process.kill()
-                worker_process.wait(2)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(2)
+            with CHILDREN_LOCK:
+                ACTIVE_CHILDREN.discard(process.pid)
+            if output is not None:
+                output.close()
         if os.getpid() == 1:
             _shutdown_children()
 
@@ -944,8 +1019,6 @@ def main() -> None:
         "--max-turns", type=int, default=0,
         help="stop a model response after this many model turns (0: unlimited)",
     )
-    parser.add_argument("--worker", type=Path,
-                        help="workspace Python file to run in the background")
     # Temporary experiment flag; remove after the workspace-hygiene evaluation.
     parser.add_argument("--clean-workspace", action="store_true")
     args = parser.parse_args()
@@ -963,7 +1036,7 @@ def main() -> None:
           clean_workspace=args.clean_workspace, model=args.model,
           effort=args.effort, session_id=args.session_id or args.resume,
           resume=args.resume is not None, python_timeout=args.python_timeout,
-          max_turns=args.max_turns, worker=args.worker)
+          max_turns=args.max_turns)
 
 
 if __name__ == "__main__":

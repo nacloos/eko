@@ -81,6 +81,12 @@ It reads JSON-line commands from standard input and writes JSON-line events to
 standard output. This is how a terminal, service, or parent agent controls it
 without becoming part of the agent core.
 
+Embedding applications can use `host.run(..., on_ready=callback)`. The callback
+receives the `AgentProcess` proxy and may start infrastructure inside the same
+sandbox with `agent.start_process(argv, cwd=..., stdout=...)`. Managed process
+output is not added to the model conversation; applications can query its status
+or signal it explicitly.
+
 ## Processes and other agents
 
 Python programs run with two useful environment variables:

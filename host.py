@@ -459,6 +459,8 @@ class AgentProcess:
         self._write_lock = threading.Lock()
         self._diagnostic_lock = threading.Lock()
         self._startup_diagnostics: list[str] = []
+        self._requests: dict[str, queue.Queue[dict]] = {}
+        self._requests_lock = threading.Lock()
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._errors = threading.Thread(target=self._read_errors, daemon=True)
         self._reader.start()
@@ -469,6 +471,13 @@ class AgentProcess:
         try:
             for line in self.proc.stdout:
                 raw = json.loads(line)
+                request_id = raw.get("request_id")
+                if request_id is not None:
+                    with self._requests_lock:
+                        response = self._requests.get(request_id)
+                    if response is not None:
+                        response.put(raw)
+                        continue
                 event = core.decode_event(raw)
                 kind = event.type
                 if kind == "ready":
@@ -514,6 +523,47 @@ class AgentProcess:
 
     def send(self, text: str) -> None:
         self._send({"type": "input", "content": [{"type": "text", "text": text}]})
+
+    def _request(self, value: dict, timeout: float = 10) -> dict:
+        request_id = uuid.uuid4().hex
+        response: queue.Queue[dict] = queue.Queue(maxsize=1)
+        with self._requests_lock:
+            self._requests[request_id] = response
+        try:
+            self._send(dict(value, request_id=request_id))
+            try:
+                reply = response.get(timeout=timeout)
+            except queue.Empty as error:
+                raise TimeoutError("agent process request timed out") from error
+        finally:
+            with self._requests_lock:
+                self._requests.pop(request_id, None)
+        if reply["type"] == "error":
+            raise RuntimeError(reply["value"])
+        return reply
+
+    def start_process(
+        self, argv: list[str], *, cwd: str | None = None,
+        stdout: str | None = None,
+    ) -> str:
+        """Start a managed process inside the agent's sandbox."""
+        request: dict[str, Any] = {"type": "process.start", "argv": argv}
+        if cwd is not None:
+            request["cwd"] = cwd
+        if stdout is not None:
+            request["stdout"] = stdout
+        return str(self._request(request)["process_id"])
+
+    def process_status(self, process_id: str) -> int | None:
+        """Return a managed process's exit status, or None while running."""
+        reply = self._request({"type": "process.status",
+                               "process_id": process_id})
+        return reply.get("returncode")
+
+    def signal_process(self, process_id: str, signum: int) -> None:
+        """Send a signal to a managed process group."""
+        self._request({"type": "process.signal", "process_id": process_id,
+                       "signal": signum})
 
     def interrupt(self) -> None:
         self._send({"type": "interrupt"})
@@ -843,7 +893,7 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    max_turns: int = 0,
                    clean_workspace: bool = False, model: str | None = None,
                    effort: str | None = None, session_id: str | None = None,
-                   resume: bool = False, worker: Path | None = None,
+                   resume: bool = False,
                    mounts: tuple[SandboxMount, ...] = ()) -> list[str]:
     source = Path(core.__file__).resolve()
     arguments = ["--cwd", "/workspace" if sandbox else str(cwd),
@@ -866,14 +916,6 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         arguments.append("--clean-workspace")
     if feral:
         arguments.append("--feral")
-    if worker is not None:
-        worker = worker.resolve()
-        try:
-            relative_worker = worker.relative_to(cwd)
-        except ValueError as error:
-            raise ValueError("worker must be inside the workspace") from error
-        target = Path("/workspace") / relative_worker if sandbox else worker
-        arguments.extend(("--worker", str(target)))
     if not sandbox:
         if mounts:
             raise ValueError("sandbox mounts require sandbox=True")
@@ -974,7 +1016,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         python_timeout: float = core.PYTHON_TIMEOUT,
         max_turns: int = 0, exit_when_idle: bool = False,
         upstream_model_socket: Path | None = None,
-        worker: Path | None = None,
+        on_ready: Callable[[AgentProcess], None] | None = None,
         mounts: tuple[SandboxMount, ...] = ()) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
@@ -1009,13 +1051,15 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
                 context=context, clean_workspace=clean_workspace,
                 python_timeout=python_timeout, max_turns=max_turns,
                 model=model, effort=effort, session_id=session_id, resume=resume,
-                worker=worker, mounts=mounts,
+                mounts=mounts,
             ),
             env=environment,
         )
         try:
             if not agent.ready.wait(10) or agent.proc.poll() is not None:
                 raise RuntimeError(agent.startup_error())
+            if on_ready is not None:
+                on_ready(agent)
             if headless:
                 observer = HeadlessObserver()
                 agent.observer = observer
@@ -1093,8 +1137,6 @@ def main() -> None:
         "--upstream-model-socket", type=Path,
         help="relay model requests to an existing host-side model service",
     )
-    parser.add_argument("--worker", type=Path,
-                        help="workspace Python file to run in the sandbox background")
     session = parser.add_mutually_exclusive_group()
     session.add_argument(
         "--session-id", help="UUID to use for a new primary conversation"
@@ -1122,7 +1164,7 @@ def main() -> None:
             python_timeout=args.python_timeout, max_turns=args.max_turns,
             exit_when_idle=args.exit_when_idle,
             upstream_model_socket=args.upstream_model_socket,
-            worker=args.worker, mounts=tuple(args.mount))
+            mounts=tuple(args.mount))
 
     try:
         if args.feral and args.cwd is None:

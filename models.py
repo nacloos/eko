@@ -298,13 +298,21 @@ class Tinker:
                 break
             messages.append(assistant)
             for call in calls:
-                if call.function.name != "python":
-                    raise RuntimeError(f"unsupported tool: {call.function.name}")
-                arguments = json.loads(call.function.arguments)
-                code = arguments.get("code")
-                if not isinstance(code, str):
-                    raise RuntimeError("python tool requires string code")
-                result = on_python(code)
+                try:
+                    if call.function.name != "python":
+                        raise ValueError(
+                            f"unsupported tool: {call.function.name}")
+                    arguments = json.loads(call.function.arguments)
+                    if not isinstance(arguments, dict):
+                        raise ValueError(
+                            "python tool arguments must be an object")
+                    code = arguments.get("code")
+                    if not isinstance(code, str):
+                        raise ValueError("python tool requires string code")
+                except (json.JSONDecodeError, ValueError) as error:
+                    result = core.Result(str(error), 1, 0)
+                else:
+                    result = on_python(code)
                 messages.append({
                     "role": "tool", "name": "python",
                     "tool_call_id": call.id or "",
