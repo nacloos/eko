@@ -720,8 +720,14 @@ def decode_message(raw: dict) -> Message:
 class Model:
     """One model conversation carried by one Unix socket connection."""
 
-    def __init__(self, endpoint: Path) -> None:
+    def __init__(self, endpoint: Path, model: str | None = None,
+                 effort: str | None = None, session_id: str | None = None,
+                 resume: bool = False) -> None:
         self.endpoint = endpoint
+        self.model = model
+        self.effort = effort
+        self.session_id = session_id
+        self.resume_session = resume
         self.write_lock = threading.Lock()
         self.context_used = 0
         self._connect()
@@ -736,7 +742,16 @@ class Model:
             self.socket.sendall((json.dumps(value, separators=(",", ":")) + "\n").encode())
 
     def start(self, system: str) -> None:
-        self._send({"system": system})
+        hello = {"system": system}
+        if self.model is not None:
+            hello["model"] = self.model
+        if self.effort is not None:
+            hello["effort"] = self.effort
+        if self.session_id is not None:
+            hello["session_id"] = self.session_id
+        if self.resume_session:
+            hello["resume"] = True
+        self._send(hello)
 
     def send(self, message: Message,
              on_text: Callable[[str], None]) -> Message:
@@ -762,6 +777,8 @@ class Model:
 
     def reset(self, system: str) -> None:
         self.close()
+        self.session_id = str(uuid.uuid4())
+        self.resume_session = False
         self._connect()
         self.context_used = 0
         self.start(system)
@@ -808,7 +825,9 @@ def decode_event(raw: dict) -> Event:
 def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           feral: bool = False, name: str = NAME,
           socket_path: Path | None = None, context: int = 0,
-          clean_workspace: bool = False) -> None:
+          clean_workspace: bool = False, model: str | None = None,
+          effort: str | None = None, session_id: str | None = None,
+          resume: bool = False) -> None:
     """Run the agent using JSON-lines stdin, stdout, and model socket."""
     if os.getpid() == 1:
         threading.Thread(target=_reap_children, daemon=True).start()
@@ -821,7 +840,8 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
             sys.stdout.flush()
 
     agent = Eko(
-        cwd, Model(model_socket), feral, socket_path=socket_path,
+        cwd, Model(model_socket, model, effort, session_id, resume), feral,
+        socket_path=socket_path,
         observer=lambda event: write(encode_event(event)), name=name,
         context=context, clean_workspace=clean_workspace)
     agent.start(prompt)
@@ -860,6 +880,11 @@ def main() -> None:
     parser.add_argument("--model-socket", type=Path,
                         default=os.environ.get("EKO_MODEL"))
     parser.add_argument("--session-socket", type=Path)
+    parser.add_argument("--model", default=os.environ.get("EKO_MODEL_NAME"))
+    parser.add_argument("--effort", default=os.environ.get("EKO_MODEL_EFFORT"))
+    session = parser.add_mutually_exclusive_group()
+    session.add_argument("--session-id")
+    session.add_argument("--resume", metavar="SESSION_ID")
     parser.add_argument("--name", default=NAME)
     parser.add_argument("--feral", action="store_true")
     parser.add_argument("--context", type=int, default=0)
@@ -873,7 +898,9 @@ def main() -> None:
         parser.error("no model service; set EKO_MODEL")
     serve(cwd, args.model_socket, prompt=args.prompt, feral=args.feral,
           name=args.name, socket_path=args.session_socket, context=args.context,
-          clean_workspace=args.clean_workspace)
+          clean_workspace=args.clean_workspace, model=args.model,
+          effort=args.effort, session_id=args.session_id or args.resume,
+          resume=args.resume is not None)
 
 
 if __name__ == "__main__":

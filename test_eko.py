@@ -20,6 +20,7 @@ from pathlib import Path
 
 import eko
 import host
+import models
 from rich.console import Console
 
 
@@ -177,7 +178,7 @@ class ModelSocketTests(unittest.TestCase):
                 client.shutdown(socket.SHUT_WR)
                 model = FakeModel(lambda text, _cancelled: text)
                 with mock.patch.object(host, "Claude", return_value=model):
-                    host._model_client(server, Path.cwd(), "fake", "low")
+                    host._model_client(server, Path.cwd(), "claude-fake", "low")
                 client.close()
 
     def test_model_connection_streams_and_returns_messages(self):
@@ -191,7 +192,7 @@ class ModelSocketTests(unittest.TestCase):
             def serve():
                 connection, _ = listener.accept()
                 host._model_client(
-                    connection, Path.cwd(), "fake", "low")
+                    connection, Path.cwd(), "claude-fake", "low")
 
             with mock.patch.object(host, "Claude", return_value=model):
                 thread = threading.Thread(target=serve, daemon=True)
@@ -206,6 +207,37 @@ class ModelSocketTests(unittest.TestCase):
 
         self.assertEqual(reply, eko.Message("assistant", (eko.Text("HELLO"),)))
         self.assertEqual(streamed, ["HELLO"])
+
+    def test_connection_handshake_selects_model_and_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            endpoint = Path(directory) / "model.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(endpoint))
+            listener.listen()
+            model = FakeModel(lambda text, _cancelled: text.upper())
+            session_id = "01234567-89ab-cdef-0123-456789abcdef"
+
+            def serve():
+                connection, _ = listener.accept()
+                host._model_client(
+                    connection, Path.cwd(), "claude-opus-5", "high")
+
+            with mock.patch.object(host, "Tinker", return_value=model) as factory:
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                remote = eko.Model(
+                    endpoint, "thinkingmachines/Inkling-Small", "low",
+                    session_id, True)
+                remote.start(eko.SYSTEM)
+                reply = remote.send(conversation("hello")[0], lambda _: None)
+                remote.close()
+                thread.join(2)
+            listener.close()
+
+        factory.assert_called_once_with(
+            Path.cwd(), "thinkingmachines/Inkling-Small", "low",
+            session_id, True)
+        self.assertEqual(reply, eko.Message("assistant", (eko.Text("HELLO"),)))
 
     def test_message_socket_round_trips_images(self):
         message = eko.Message("user", (
@@ -1290,7 +1322,7 @@ print("DAEMONS", *(process.pid for process in processes))
             model.started = True
 
         model._start = start
-        with mock.patch.object(host, "CALL_TIMEOUT", .5):
+        with mock.patch.object(models, "CALL_TIMEOUT", .5):
             with self.assertRaisesRegex(RuntimeError, "context was not reset"):
                 model.complete(eko.SYSTEM, conversation("orphaned output")[0], lambda _: None)
         self.assertGreaterEqual(len(starts), 2)
