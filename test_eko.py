@@ -855,6 +855,30 @@ print("started")
         wait_until(lambda: agent.model.messages == ["busy", "arrived while busy"])
         self.stop(agent)
 
+    def test_invalid_external_input_only_rejects_its_connection(self):
+        agent, ui = self.agent(lambda _message, _cancelled: "<done/>")
+        agent.start("hello")
+        wait_until(lambda: agent.state == "idle")
+
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(1)
+            client.connect(str(agent.socket_path))
+            client.sendall(b'{"type":"unknown"}\n')
+            reply = json.loads(client.makefile("rb").readline())
+
+        self.assertEqual(reply, {
+            "type": "error",
+            "value": "Input rejected: unsupported session event type",
+        })
+        self.assertEqual(ui.errors, [])
+        assert agent.thread is not None
+        self.assertTrue(agent.thread.is_alive())
+
+        agent.send("still running")
+        wait_until(lambda: agent.model.messages == ["hello", "still running"])
+        wait_until(lambda: agent.state == "idle")
+        self.stop(agent)
+
     def test_external_multimodal_input_has_attested_process_provenance(self):
         png = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode()
         event = eko.decode_input({

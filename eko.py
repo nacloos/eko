@@ -449,7 +449,16 @@ class Eko:
             except (ConnectionError, OSError):
                 return
             except Exception as error:
-                self._emit(Event("error", f"Agent input rejected: {error}"))
+                # A bad external client must not fail the agent's model turn.
+                # Report the protocol error only to the connection that sent it.
+                try:
+                    reply = json.dumps({
+                        "type": "error",
+                        "value": f"Input rejected: {error}",
+                    }, separators=(",", ":")).encode() + b"\n"
+                    connection.sendall(reply)
+                except (ConnectionError, OSError):
+                    pass
 
 # ── Input decoding ───────────────────────────────────────────────────────────
 
