@@ -1077,6 +1077,85 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(records[-1]["type"], "episode_end")
             self.assertEqual(records[-1]["reason"], "max_turns")
 
+    def test_tinker_interrupt_closes_trajectory_after_tool_result(self):
+        class Chunk:
+            length = 1
+
+        class Prompt:
+            chunks = [Chunk()]
+
+            def model_dump(self, mode=None):
+                return {"chunks": [{"type": "encoded_text", "tokens": [10]}]}
+
+        class Function:
+            name = "python"
+            arguments = json.dumps({"code": "interrupt()"})
+
+        class Call:
+            id = "call-1"
+            function = Function()
+
+            def model_dump(self, mode=None):
+                return {"type": "function", "id": self.id,
+                        "function": {"name": self.function.name,
+                                     "arguments": self.function.arguments}}
+
+        class Renderer:
+            def create_conversation_prefix_with_tools(self, _tools, _system):
+                return []
+
+            def build_generation_prompt(self, _messages, **_options):
+                return Prompt()
+
+            def get_stop_sequences(self):
+                return []
+
+            def parse_response(self, _tokens):
+                return {"role": "assistant", "content": "",
+                        "tool_calls": [Call()]}, None
+
+        class Sequence:
+            tokens = [20]
+            logprobs = [-.1]
+            stop_reason = "stop"
+
+        class Future:
+            def result(self, timeout=None):
+                return type("Response", (), {"sequences": [Sequence()]})()
+
+        class Client:
+            calls = 0
+
+            def get_base_model(self):
+                return "thinkingmachines/Inkling-Small"
+
+            def sample(self, *_args, **_kwargs):
+                self.calls += 1
+                return Future()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trajectory.jsonl"
+            model = models.Tinker(
+                Path.cwd(), client=Client(), renderer=Renderer(),
+                trajectory_path=path)
+
+            def interrupt(_code):
+                model.interrupt()
+                return eko.Result("Interrupted", 130, 0)
+
+            with self.assertRaises(InterruptedError):
+                model.complete(
+                    "system", conversation("start")[0], lambda _text: None,
+                    interrupt)
+
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([record["type"] for record in records],
+                             ["transition", "episode_end"])
+            self.assertEqual(records[-1]["reason"], "interrupted")
+            self.assertEqual(records[-1]["turns"], 1)
+            self.assertEqual(model.messages[-1]["role"], "tool")
+            self.assertEqual(model.client.calls, 1)
+
     def test_claude_process_exit_clears_python_broker_handler(self):
         model = host.Claude(Path.cwd(), "fake", "low")
 

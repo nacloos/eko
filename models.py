@@ -249,87 +249,102 @@ class Tinker:
         messages = [*self.messages, user]
         turn_count = 0
         import tinker
-        while True:
-            turn_count += 1
-            prompt = renderer.build_generation_prompt(messages, **options)
-            future = client.sample(
-                prompt, num_samples=1,
-                sampling_params=tinker.SamplingParams(
-                    max_tokens=MAX_TOKENS, stop=renderer.get_stop_sequences()))
+        try:
             while True:
+                prompt = renderer.build_generation_prompt(messages, **options)
                 if self.interrupted.is_set():
                     raise InterruptedError
-                try:
-                    response = future.result(timeout=.1)
+                future = client.sample(
+                    prompt, num_samples=1,
+                    sampling_params=tinker.SamplingParams(
+                        max_tokens=MAX_TOKENS, stop=renderer.get_stop_sequences()))
+                while True:
+                    if self.interrupted.is_set():
+                        raise InterruptedError
+                    try:
+                        response = future.result(timeout=.1)
+                        break
+                    except FutureTimeout:
+                        continue
+                turn_count += 1
+                parsed, _termination = renderer.parse_response(
+                    response.sequences[0].tokens)
+                sequence = response.sequences[0]
+                assistant = dict(parsed)
+                calls = assistant.get("tool_calls") or []
+                assistant["tool_calls"] = [
+                    call.model_dump(mode="json") if hasattr(call, "model_dump") else call
+                    for call in calls
+                ] if calls else []
+                self._record_trajectory({
+                    "type": "transition",
+                    "turn": turn_count,
+                    "observation": prompt.model_dump(mode="json"),
+                    "action": {
+                        "tokens": list(sequence.tokens),
+                        "logprobs": (None if sequence.logprobs is None
+                                       else list(sequence.logprobs)),
+                        "stop_reason": str(sequence.stop_reason),
+                    },
+                    "assistant": assistant,
+                })
+                if not calls:
+                    answer = self._text(assistant)
+                    on_text(answer)
+                    messages.append(assistant)
+                    self._record_trajectory({
+                        "type": "episode_end", "reason": "completed",
+                        "turns": turn_count,
+                        "final_observation": renderer.build_generation_prompt(
+                            messages, **options).model_dump(mode="json"),
+                    })
                     break
-                except FutureTimeout:
-                    continue
-            parsed, _termination = renderer.parse_response(
-                response.sequences[0].tokens)
-            sequence = response.sequences[0]
-            assistant = dict(parsed)
-            calls = assistant.get("tool_calls") or []
-            assistant["tool_calls"] = [
-                call.model_dump(mode="json") if hasattr(call, "model_dump") else call
-                for call in calls
-            ] if calls else []
-            self._record_trajectory({
-                "type": "transition",
-                "turn": turn_count,
-                "observation": prompt.model_dump(mode="json"),
-                "action": {
-                    "tokens": list(sequence.tokens),
-                    "logprobs": (None if sequence.logprobs is None
-                                   else list(sequence.logprobs)),
-                    "stop_reason": str(sequence.stop_reason),
-                },
-                "assistant": assistant,
-            })
-            if not calls:
-                answer = self._text(assistant)
-                on_text(answer)
                 messages.append(assistant)
-                self._record_trajectory({
-                    "type": "episode_end", "reason": "completed",
-                    "turns": turn_count,
-                    "final_observation": renderer.build_generation_prompt(
-                        messages, **options).model_dump(mode="json"),
-                })
-                break
-            messages.append(assistant)
-            for call in calls:
-                try:
-                    if call.function.name != "python":
-                        raise ValueError(
-                            f"unsupported tool: {call.function.name}")
-                    arguments = json.loads(call.function.arguments)
-                    if not isinstance(arguments, dict):
-                        raise ValueError(
-                            "python tool arguments must be an object")
-                    code = arguments.get("code")
-                    if not isinstance(code, str):
-                        raise ValueError("python tool requires string code")
-                except (json.JSONDecodeError, ValueError) as error:
-                    result = core.Result(str(error), 1, 0)
-                else:
-                    result = on_python(code)
-                messages.append({
-                    "role": "tool", "name": "python",
-                    "tool_call_id": call.id or "",
-                    "content": tinker_tool_content(result),
-                })
-            if max_turns and turn_count >= max_turns:
-                self._record_trajectory({
-                    "type": "episode_end", "reason": "max_turns",
-                    "turns": turn_count,
-                    "final_observation": renderer.build_generation_prompt(
-                        messages, **options).model_dump(mode="json"),
-                })
-                self._save(messages)
-                self.messages = messages
-                self.context_used = sum(
-                    int(chunk.length) for chunk in prompt.chunks)
-                return core.Message("assistant", ())
+                for call in calls:
+                    try:
+                        if call.function.name != "python":
+                            raise ValueError(
+                                f"unsupported tool: {call.function.name}")
+                        arguments = json.loads(call.function.arguments)
+                        if not isinstance(arguments, dict):
+                            raise ValueError(
+                                "python tool arguments must be an object")
+                        code = arguments.get("code")
+                        if not isinstance(code, str):
+                            raise ValueError("python tool requires string code")
+                    except (json.JSONDecodeError, ValueError) as error:
+                        result = core.Result(str(error), 1, 0)
+                    else:
+                        result = on_python(code)
+                    messages.append({
+                        "role": "tool", "name": "python",
+                        "tool_call_id": call.id or "",
+                        "content": tinker_tool_content(result),
+                    })
+                if max_turns and turn_count >= max_turns:
+                    self._record_trajectory({
+                        "type": "episode_end", "reason": "max_turns",
+                        "turns": turn_count,
+                        "final_observation": renderer.build_generation_prompt(
+                            messages, **options).model_dump(mode="json"),
+                    })
+                    self._save(messages)
+                    self.messages = messages
+                    self.context_used = sum(
+                        int(chunk.length) for chunk in prompt.chunks)
+                    return core.Message("assistant", ())
+        except InterruptedError:
+            final_prompt = renderer.build_generation_prompt(messages, **options)
+            self._record_trajectory({
+                "type": "episode_end", "reason": "interrupted",
+                "turns": turn_count,
+                "final_observation": final_prompt.model_dump(mode="json"),
+            })
+            self._save(messages)
+            self.messages = messages
+            self.context_used = sum(
+                int(chunk.length) for chunk in final_prompt.chunks)
+            raise
         self._save(messages)
         self.messages = messages
         self.context_used = sum(int(chunk.length) for chunk in prompt.chunks)
