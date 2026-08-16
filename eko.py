@@ -51,11 +51,6 @@ NAME = "Eko"
 SYSTEM = """You are {name}.
 You are in {folder}.
 
-Express your reasoning in ordinary assistant text throughout the task. Before each
-tool call, explain what you learned from prior results, what you currently believe,
-and why the next action will help. Include enough detail to make the reasoning
-understandable and useful on its own.
-
 Use the python tool to act. It runs in that folder and returns its combined output,
 marking nonzero exits as errors.
 
@@ -82,6 +77,11 @@ a workspace-relative "path", or base64 "data" with "media_type". Send
 EKO_AGENT points to this agent's own executable. EKO_WORLD, when available, is
 an OpenRPC Unix socket.{mode}
 """
+
+CLAUDE_REASONING = """Express your reasoning in ordinary assistant text throughout
+the task. Before each tool call, explain what you learned from prior results, what
+you currently believe, and why the next action will help. Include enough detail to
+make the reasoning understandable and useful on its own."""
 
 NUDGE = "Use the python tool, or <done/> if the prompt is resolved."
 FERAL_NUDGE = "Use the python tool."
@@ -185,6 +185,9 @@ class Eko:
         mode = "" if feral else NORMAL_MODE
         self.system = SYSTEM.format(
             name=name, folder=self.cwd, mode=mode)
+        model_name = getattr(model, "model", None)
+        if isinstance(model_name, str) and model_name.startswith("claude-"):
+            self.system += f"\n{CLAUDE_REASONING}\n"
         if clean_workspace:
             self.system += f"\n{CLEAN_WORKSPACE}\n"
         self.messages: list[Message] = []

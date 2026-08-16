@@ -115,12 +115,6 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(agent.python_timeout, 30)
 
     def test_system_distinguishes_user_steering_from_async_observations(self):
-        self.assertIn(
-            "Express your reasoning in ordinary assistant text throughout the task.",
-            eko.SYSTEM)
-        self.assertIn("what you learned from prior results", eko.SYSTEM)
-        self.assertIn("what you currently believe", eko.SYSTEM)
-        self.assertIn("why the next action will help", eko.SYSTEM)
         self.assertIn('Source "user-terminal" is a controlling user', eko.SYSTEM)
         self.assertIn('before continuing the current plan', eko.SYSTEM)
         self.assertIn('Process and harness inputs are observations', eko.SYSTEM)
@@ -128,6 +122,19 @@ class CoreTests(unittest.TestCase):
         self.assertIn('<done/> and a Python tool call are mutually exclusive',
                       eko.NORMAL_MODE)
         self.assertNotIn('Python block', eko.NORMAL_MODE)
+
+    def test_reasoning_prompt_is_only_added_for_claude_models(self):
+        claude = FakeModel(lambda *_: "<done/>")
+        claude.model = "claude-opus-5"
+        other = FakeModel(lambda *_: "<done/>")
+        other.model = "openai/gpt-5"
+
+        claude_agent = eko.Eko(Path.cwd(), claude)
+        other_agent = eko.Eko(Path.cwd(), other)
+
+        self.assertIn(eko.CLAUDE_REASONING, claude_agent.system)
+        self.assertNotIn(eko.CLAUDE_REASONING, other_agent.system)
+        self.assertNotIn(eko.CLAUDE_REASONING, eko.SYSTEM)
 
     def test_mcp_python_tool_raises_claude_text_result_limit(self):
         tool = models.mcp_python_tool()
