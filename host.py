@@ -623,12 +623,17 @@ def _model_client(connection: socket.socket, cwd: Path,
 
         try:
             assert conversation is not None
+            options = {"max_turns": max_turns}
+            if feral:
+                options["feral"] = True
             reply = conversation.complete(
                 system, core.decode_message(message),
                 lambda text: send({"delta": text}), python,
-                max_turns=max_turns)
+                **options)
             send({"message": core.encode_message(reply),
-                  "context_used": conversation.context_used})
+                  "context_used": conversation.context_used,
+                  "limit_reached": getattr(
+                      conversation, "limit_reached", False)})
         except InterruptedError:
             send({"error": "Interrupted", "interrupted": True})
         except Exception as error:
@@ -648,12 +653,14 @@ def _model_client(connection: socket.socket, cwd: Path,
                 requested_session = initial.get("session_id", session_id)
                 requested_resume = initial.get("resume", resume)
                 max_turns = initial.get("max_turns", 0)
+                feral = initial.get("feral", False)
                 if (not isinstance(requested_model, str)
                         or (requested_effort is not None
                             and not isinstance(requested_effort, str))
                         or (requested_session is not None
                             and not isinstance(requested_session, str))
                         or not isinstance(requested_resume, bool)
+                        or not isinstance(feral, bool)
                         or not isinstance(max_turns, int)
                         or isinstance(max_turns, bool)
                         or max_turns < 0):

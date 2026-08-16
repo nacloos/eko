@@ -66,6 +66,8 @@ class FakeModel:
         self.context_used = 0
         self.resets = 0
         self.max_turns = None
+        self.feral = False
+        self.limit_reached = False
 
     def start(self, system):
         self.system = system
@@ -88,8 +90,9 @@ class FakeModel:
         return eko.Message("assistant", (eko.Text(reply),))
 
     def complete(self, system, message, write, python=lambda _code: None,
-                 max_turns=0):
+                 max_turns=0, feral=False):
         self.max_turns = max_turns
+        self.feral = feral
         self.start(system)
         return self.send(message, write, python)
 
@@ -365,7 +368,7 @@ class ModelSocketTests(unittest.TestCase):
                 thread.start()
                 remote = eko.Model(
                     endpoint, "thinkingmachines/Inkling-Small", "low",
-                    session_id, True, 1)
+                    session_id, True, 1, True)
                 remote.start(eko.SYSTEM)
                 reply = remote.send(conversation("hello")[0], lambda _: None)
                 remote.close()
@@ -377,6 +380,7 @@ class ModelSocketTests(unittest.TestCase):
             session_id, True)
         self.assertEqual(reply, eko.Message("assistant", (eko.Text("HELLO"),)))
         self.assertEqual(model.max_turns, 1)
+        self.assertTrue(model.feral)
         self.assertFalse(model.cancelled.is_set())
 
     def test_message_socket_round_trips_images(self):
@@ -608,6 +612,26 @@ class EkoTests(unittest.TestCase):
 
         self.assertNotIn("Feral mode", model.system)
         self.assertEqual(model.messages[0], "Begin.")
+        self.stop(agent)
+
+    def test_feral_agent_stops_only_when_model_reports_turn_limit(self):
+        calls = 0
+        model = None
+
+        def reply(_message, _cancelled):
+            nonlocal calls
+            calls += 1
+            assert model is not None
+            model.limit_reached = calls == 2
+            return f"status-{calls}"
+
+        model = FakeModel(reply)
+        agent = eko.Eko(Path.cwd(), model, feral=True, max_turns=2)
+        agent.start()
+        wait_until(lambda: calls == 2 and agent.state == "idle")
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(model.messages, ["Begin.", eko.FERAL_NUDGE])
         self.stop(agent)
 
     def test_terminal_input_is_limited_before_the_model(self):
@@ -1076,6 +1100,74 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(reply, eko.Message("assistant", ()))
             self.assertEqual(records[-1]["type"], "episode_end")
             self.assertEqual(records[-1]["reason"], "max_turns")
+
+    def test_tinker_feral_text_continues_until_cumulative_turn_limit(self):
+        class Chunk:
+            length = 1
+
+        class Prompt:
+            chunks = [Chunk()]
+
+            def model_dump(self, mode=None):
+                return {"chunks": [{"type": "encoded_text", "tokens": [10]}]}
+
+        class Renderer:
+            def create_conversation_prefix_with_tools(self, _tools, _system):
+                return []
+
+            def build_generation_prompt(self, _messages, **_options):
+                return Prompt()
+
+            def get_stop_sequences(self):
+                return []
+
+            def parse_response(self, tokens):
+                return {"role": "assistant", "content": f"text-{tokens[0]}",
+                        "tool_calls": []}, None
+
+        class Future:
+            def __init__(self, token):
+                self.token = token
+
+            def result(self, timeout=None):
+                sequence = type("Sequence", (), {
+                    "tokens": [self.token], "logprobs": [-.1],
+                    "stop_reason": "stop",
+                })()
+                return type("Response", (), {"sequences": [sequence]})()
+
+        class Client:
+            calls = 0
+
+            def get_base_model(self):
+                return "thinkingmachines/Inkling-Small"
+
+            def sample(self, *_args, **_kwargs):
+                self.calls += 1
+                return Future(20 + self.calls)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trajectory.jsonl"
+            model = models.Tinker(
+                Path.cwd(), client=Client(), renderer=Renderer(),
+                trajectory_path=path)
+            reply = model.complete(
+                "system", conversation("Begin.")[0], lambda _text: None,
+                lambda _code: self.fail("unexpected Python call"),
+                max_turns=2, feral=True)
+
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([record["type"] for record in records],
+                             ["transition", "transition", "episode_end"])
+            self.assertEqual(records[-1]["reason"], "max_turns")
+            self.assertEqual(records[-1]["turns"], 2)
+            self.assertTrue(model.limit_reached)
+            self.assertEqual(model.client.calls, 2)
+            self.assertEqual(reply, eko.Message(
+                "assistant", (eko.Text("text-22"),)))
+            self.assertEqual(model.messages[-2]["role"], "user")
+            self.assertIn('<input source="harness">\nUse the python tool.',
+                          model.messages[-2]["content"])
 
     def test_tinker_interrupt_closes_trajectory_after_tool_result(self):
         class Chunk:

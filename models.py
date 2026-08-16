@@ -134,6 +134,7 @@ class Tinker:
         self.messages: list[dict] = []
         self.interrupted = threading.Event()
         self.context_used = 0
+        self.limit_reached = False
         configured_trajectory = os.environ.get("EKO_TRAJECTORY_PATH")
         self.trajectory_path = (trajectory_path or
             (Path(configured_trajectory) if configured_trajectory else None))
@@ -231,7 +232,7 @@ class Tinker:
     def complete(self, system: str, message: core.Message,
                  on_text: Callable[[str], None],
                  on_python: Callable[[str], core.Result],
-                 max_turns: int = 0) -> core.Message:
+                 max_turns: int = 0, feral: bool = False) -> core.Message:
         if message.role != "user":
             raise ValueError("model input must be a user message")
         if self.system is None:
@@ -242,6 +243,7 @@ class Tinker:
         elif self.system != system:
             raise ValueError("session system context does not match this invocation")
         self.interrupted.clear()
+        self.limit_reached = False
         user = _message(message)
         client, renderer = self._connect()
         options = ({"effort": EFFORT[self.effort]}
@@ -292,8 +294,17 @@ class Tinker:
                     answer = self._text(assistant)
                     on_text(answer)
                     messages.append(assistant)
+                    if feral and (not max_turns or turn_count < max_turns):
+                        messages.append(_message(core.user_message((
+                            core.Input(core.HARNESS, (
+                                core.Text(core.FERAL_NUDGE),)),
+                        ))))
+                        continue
+                    reason = ("max_turns" if feral and max_turns
+                              and turn_count >= max_turns else "completed")
+                    self.limit_reached = reason == "max_turns"
                     self._record_trajectory({
-                        "type": "episode_end", "reason": "completed",
+                        "type": "episode_end", "reason": reason,
                         "turns": turn_count,
                         "final_observation": renderer.build_generation_prompt(
                             messages, **options).model_dump(mode="json"),
@@ -322,6 +333,7 @@ class Tinker:
                         "content": tinker_tool_content(result),
                     })
                 if max_turns and turn_count >= max_turns:
+                    self.limit_reached = True
                     self._record_trajectory({
                         "type": "episode_end", "reason": "max_turns",
                         "turns": turn_count,
@@ -512,6 +524,7 @@ class Claude:
         self.started = resume
         self.interrupted = threading.Event()
         self.context_used = 0
+        self.limit_reached = False
         self.broker = PythonBroker()
         self.write_lock = threading.Lock()
 
@@ -631,11 +644,12 @@ class Claude:
                  on_python: Callable[[str], core.Result] | None = None,
                  retry_delay: float = .2,
                  retries: int = 0,
-                 max_turns: int = 0) -> core.Message:
+                 max_turns: int = 0, feral: bool = False) -> core.Message:
         """Complete a history using the CLI's internally persisted conversation."""
         if message.role != "user":
             raise ValueError("model input must be a user message")
         self.interrupted.clear()
+        self.limit_reached = False
         resuming = self.started
         if self.proc is None or self.proc.poll() is not None:
             if max_turns:
@@ -671,6 +685,7 @@ class Claude:
                         if block.get("type") == "text")
                 elif data.get("type") == "result":
                     if data.get("subtype") == "error_max_turns" and max_turns:
+                        self.limit_reached = True
                         usage = data.get("usage") or {}
                         self.context_used = (int(usage["prompt_tokens"])
                                              if usage.get("prompt_tokens") is not None
@@ -691,7 +706,7 @@ class Claude:
                                     and self._repair_session()):
                                 return self.complete(
                                     system, message, on_text, on_python,
-                                    retry_delay, retries, max_turns)
+                                    retry_delay, retries, max_turns, feral)
                             if (retries < RESUME_RETRIES
                                     and not parts and not complete):
                                 if self.interrupted.wait(retry_delay):
@@ -699,7 +714,7 @@ class Claude:
                                 return self.complete(
                                     system, message, on_text, on_python,
                                     min(retry_delay * 2, 5), retries + 1,
-                                    max_turns)
+                                    max_turns, feral)
                             raise RuntimeError(
                                 "Model session could not resume; context was not "
                                 f"reset. {detail or ''}".rstrip())

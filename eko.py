@@ -361,7 +361,7 @@ class Eko:
 
                     if "<done/>" in response and not self.feral:
                         inputs = None
-                    elif self.max_turns:
+                    elif getattr(self.model, "limit_reached", False):
                         inputs = None
                     elif not acted:
                         inputs = (Input(HARNESS, (Text(
@@ -728,13 +728,16 @@ class Model:
 
     def __init__(self, endpoint: Path, model: str | None = None,
                  effort: str | None = None, session_id: str | None = None,
-                 resume: bool = False, max_turns: int = 0) -> None:
+                 resume: bool = False, max_turns: int = 0,
+                 feral: bool = False) -> None:
         self.endpoint = endpoint
         self.model = model
         self.effort = effort
         self.session_id = session_id
         self.resume_session = resume
         self.max_turns = max_turns
+        self.feral = feral
+        self.limit_reached = False
         self.write_lock = threading.Lock()
         self.context_used = 0
         self._connect()
@@ -760,6 +763,8 @@ class Model:
             hello["resume"] = True
         if self.max_turns:
             hello["max_turns"] = self.max_turns
+        if self.feral:
+            hello["feral"] = True
         self._send(hello)
 
     def send(self, message: Message, on_text: Callable[[str], None],
@@ -781,6 +786,7 @@ class Model:
                 }})
             elif "message" in event:
                 self.context_used = int(event.get("context_used") or 0)
+                self.limit_reached = bool(event.get("limit_reached", False))
                 return decode_message(event["message"])
             elif "error" in event:
                 if event.get("interrupted"):
@@ -863,7 +869,7 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
 
     agent = Eko(
         cwd, Model(model_socket, model, effort, session_id, resume,
-                   max_turns), feral,
+                   max_turns, feral), feral,
         socket_path=socket_path,
         observer=lambda event: write(encode_event(event)), name=name,
         context=context, clean_workspace=clean_workspace,
