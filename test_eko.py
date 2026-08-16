@@ -1308,6 +1308,15 @@ class ModelTests(unittest.TestCase):
         index = command.index("--python-timeout")
         self.assertEqual(command[index + 1], "12.5")
 
+    def test_agent_command_starts_with_initial_prompt(self):
+        prompt = "Start with this instruction, not feral Begin."
+        command = host._agent_command(
+            Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=True,
+            name="Eko", prompt=prompt,
+        )
+
+        self.assertEqual(command[-2:], ["--", prompt])
+
     def test_agent_command_forwards_max_turns(self):
         command = host._agent_command(
             Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=False,

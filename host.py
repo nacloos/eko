@@ -918,6 +918,7 @@ def _package_mounts(environment: Path, base: Path) -> tuple[list[str], list[str]
 
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    feral: bool, name: str, context: int = 0,
+                   prompt: str | None = None,
                    python_timeout: float = core.PYTHON_TIMEOUT,
                    max_turns: int = 0,
                    clean_workspace: bool = False, model: str | None = None,
@@ -947,6 +948,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         arguments.append("--clean-workspace")
     if feral:
         arguments.append("--feral")
+    if prompt:
+        arguments.extend(("--", prompt))
     if not sandbox:
         if mounts:
             raise ValueError("sandbox mounts require sandbox=True")
@@ -1085,7 +1088,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
                 context=context, clean_workspace=clean_workspace,
                 python_timeout=python_timeout, max_turns=max_turns,
                 model=model, effort=effort, session_id=session_id, resume=resume,
-                mounts=mounts,
+                prompt=prompt, mounts=mounts,
             ),
             env=environment,
         )
@@ -1098,8 +1101,6 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
                 observer = HeadlessObserver()
                 agent.observer = observer
                 print(f"EKO_SESSION={runtime / 'session.sock'}", flush=True)
-                if prompt:
-                    agent.send(prompt)
                 while (agent.proc.poll() is None
                        and not (exit_when_idle and observer.finished.is_set())):
                     time.sleep(.2)
@@ -1108,7 +1109,6 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             ui.header(cwd, model, name)
             ui.connect(agent)
             ui.on_exit = lambda: (agent.stop(), ui.exit())
-            ui.on_start = lambda: agent.send(prompt) if prompt else None
             if prompt:
                 ui.user(prompt)
             ui.run()
