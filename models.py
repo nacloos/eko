@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import shutil
 import signal
@@ -108,6 +109,34 @@ def _message(message: core.Message) -> dict:
     return {"role": message.role, "content": content}
 
 
+def _jsonable_message(message: dict) -> dict:
+    """Serialize Cookbook message metadata without changing live renderer types."""
+    value = dict(message)
+    for key in ("tool_calls", "unparsed_tool_calls"):
+        if key in value:
+            value[key] = [
+                item.model_dump(mode="json")
+                if hasattr(item, "model_dump") else item
+                for item in value[key]
+            ]
+    return value
+
+
+def _restore_message(message: dict) -> dict:
+    """Restore typed tool metadata required by Cookbook renderers."""
+    from tinker_cookbook.renderers import ToolCall, UnparsedToolCall
+
+    value = dict(message)
+    types = {"tool_calls": ToolCall, "unparsed_tool_calls": UnparsedToolCall}
+    for key, kind in types.items():
+        if key in value:
+            value[key] = [
+                kind.model_validate(item) if isinstance(item, dict) else item
+                for item in value[key]
+            ]
+    return value
+
+
 class Tinker:
     """A durable conversation sampled through Tinker's native Cookbook API."""
 
@@ -177,14 +206,16 @@ class Tinker:
         self.base_model = state["base_model"]
         self.system = state["system"]
         self.effort = self.effort if self.effort is not None else state.get("effort")
-        self.messages = state["messages"]
+        self.messages = [_restore_message(message)
+                         for message in state["messages"]]
 
     def _save(self, messages: list[dict]) -> None:
         state = {
             "version": SESSION_VERSION, "session_id": self.session_id,
             "model": self.model, "base_model": self.base_model,
             "effort": self.effort, "cwd": str(self.cwd),
-            "system": self.system, "messages": messages,
+            "system": self.system,
+            "messages": [_jsonable_message(message) for message in messages],
         }
         self.state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = self.state_file.with_name(
@@ -246,8 +277,14 @@ class Tinker:
         self.limit_reached = False
         user = _message(message)
         client, renderer = self._connect()
+        # Effort is a renderer-specific extension (currently used by TML's
+        # Inkling renderer), not part of the common cookbook renderer API.
+        # Passing it to renderers such as Kimi raises TypeError before the
+        # first sample is submitted.
+        supports_effort = "effort" in inspect.signature(
+            renderer.build_generation_prompt).parameters
         options = ({"effort": EFFORT[self.effort]}
-                   if self.effort is not None else {})
+                   if self.effort is not None and supports_effort else {})
         messages = [*self.messages, user]
         turn_count = 0
         import tinker
@@ -274,10 +311,7 @@ class Tinker:
                 sequence = response.sequences[0]
                 assistant = dict(parsed)
                 calls = assistant.get("tool_calls") or []
-                assistant["tool_calls"] = [
-                    call.model_dump(mode="json") if hasattr(call, "model_dump") else call
-                    for call in calls
-                ] if calls else []
+                serialized_assistant = _jsonable_message(assistant)
                 self._record_trajectory({
                     "type": "transition",
                     "turn": turn_count,
@@ -288,7 +322,7 @@ class Tinker:
                                        else list(sequence.logprobs)),
                         "stop_reason": str(sequence.stop_reason),
                     },
-                    "assistant": assistant,
+                    "assistant": serialized_assistant,
                 })
                 if not calls:
                     answer = self._text(assistant)

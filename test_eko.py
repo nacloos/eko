@@ -1004,6 +1004,89 @@ class RenderingTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_tinker_preserves_typed_tool_calls_for_kimi_renderer(self):
+        from tinker_cookbook.renderers import ToolCall
+
+        class Chunk:
+            length = 1
+
+        class Prompt:
+            chunks = [Chunk()]
+
+            def model_dump(self, mode=None):
+                return {"chunks": [{"type": "encoded_text", "tokens": [10]}]}
+
+        class Renderer:
+            def create_conversation_prefix_with_tools(self, _tools, _system):
+                return []
+
+            prompts = 0
+
+            def build_generation_prompt(self, messages, **_options):
+                self.prompts += 1
+                if self.prompts == 2:
+                    call = messages[-2]["tool_calls"][0]
+                    if not isinstance(call, ToolCall):
+                        raise TypeError(
+                            f"expected ToolCall, got {type(call).__name__}")
+                return Prompt()
+
+            def get_stop_sequences(self):
+                return []
+
+            def parse_response(self, tokens):
+                if tokens == [20]:
+                    return {"role": "assistant", "content": "", "tool_calls": [
+                        ToolCall(
+                            id="functions.python:0",
+                            function=ToolCall.FunctionBody(
+                                name="python", arguments=json.dumps(
+                                    {"code": "print('hello')"}))),
+                    ]}, None
+                return {"role": "assistant", "content": "finished",
+                        "tool_calls": []}, None
+
+        class Future:
+            def __init__(self, token):
+                self.token = token
+
+            def result(self, timeout=None):
+                sequence = type("Sequence", (), {
+                    "tokens": [self.token], "logprobs": [-.1],
+                    "stop_reason": "stop",
+                })()
+                return type("Response", (), {"sequences": [sequence]})()
+
+        class Client:
+            calls = 0
+
+            def get_base_model(self):
+                return "moonshotai/Kimi-K2.6"
+
+            def sample(self, *_args, **_kwargs):
+                self.calls += 1
+                return Future(19 + self.calls)
+
+        executed = []
+        state_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        model = models.Tinker(
+            Path.cwd(), client=Client(), renderer=Renderer(),
+            state_root=state_root)
+        reply = model.complete(
+            "system", conversation("start")[0], lambda _text: None,
+            lambda code: executed.append(code) or eko.Result("hello\n", 0, 0))
+
+        self.assertEqual(executed, ["print('hello')"])
+        self.assertEqual(reply, eko.Message(
+            "assistant", (eko.Text("finished"),)))
+        tool_message = next(
+            message for message in model.messages if message["role"] == "tool")
+        self.assertEqual(tool_message["tool_call_id"], "functions.python:0")
+        saved = json.loads(model.state_file.read_text())
+        saved_call = next(message for message in saved["messages"]
+                          if message["role"] == "assistant")["tool_calls"][0]
+        self.assertEqual(saved_call["id"], "functions.python:0")
+
     def test_tinker_trajectory_records_exact_tokens_logprobs_and_prompt(self):
         class Chunk:
             length = 2
