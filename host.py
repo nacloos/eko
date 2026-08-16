@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import eko as core
+import models
 from models import (Claude, Tinker, _claude_content, ensure_claude_auth,
                     ensure_tinker_auth)
 from prompt_toolkit import Application
@@ -593,6 +594,7 @@ def _model_client(connection: socket.socket, cwd: Path,
                   model: str, effort: str | None, session_id: str | None = None,
                   resume: bool = False, tinker_client: Any = None,
                   trajectory_path: Path | None = None,
+                  trajectory_dir: Path | None = None,
                   state_root: Path | None = None) -> None:
     """Give one agent connection the conversation requested in its handshake."""
     conversation = None
@@ -666,6 +668,19 @@ def _model_client(connection: socket.socket, cwd: Path,
                         options["client"] = tinker_client
                     if trajectory_path is not None:
                         options["trajectory_path"] = trajectory_path
+                    elif trajectory_dir is not None:
+                        if requested_session is None:
+                            send({"error": (
+                                "trajectory_dir requires a session ID")})
+                            return
+                        try:
+                            trace_id = str(uuid.UUID(requested_session))
+                        except ValueError:
+                            send({"error": (
+                                f"invalid session ID: {requested_session}")})
+                            return
+                        options["trajectory_path"] = (
+                            trajectory_dir / f"{trace_id}.jsonl")
                     if state_root is not None:
                         options["state_root"] = state_root
                     conversation = Tinker(
@@ -713,11 +728,16 @@ class ModelServer:
                  session_id: str | None = None, resume: bool = False,
                  tinker_client: Any = None,
                  trajectory_path: Path | None = None,
+                 trajectory_dir: Path | None = None,
                  state_root: Path | None = None) -> None:
+        if trajectory_path is not None and trajectory_dir is not None:
+            raise ValueError(
+                "trajectory_path and trajectory_dir are mutually exclusive")
         self.path, self.cwd, self.model, self.effort = path, cwd, model, effort
         self.primary_session = (session_id, resume)
         self.tinker_client = tinker_client
         self.trajectory_path = trajectory_path
+        self.trajectory_dir = trajectory_dir
         self.state_root = state_root
         self.session_lock = threading.Lock()
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -747,6 +767,8 @@ class ModelServer:
                 options["tinker_client"] = self.tinker_client
             if self.trajectory_path is not None:
                 options["trajectory_path"] = self.trajectory_path
+            if self.trajectory_dir is not None:
+                options["trajectory_dir"] = self.trajectory_dir
             if self.state_root is not None:
                 options["state_root"] = self.state_root
             thread = threading.Thread(
@@ -896,6 +918,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    resume: bool = False,
                    mounts: tuple[SandboxMount, ...] = ()) -> list[str]:
     source = Path(core.__file__).resolve()
+    host_source = Path(__file__).resolve()
+    models_source = Path(models.__file__).resolve()
     arguments = ["--cwd", "/workspace" if sandbox else str(cwd),
                  "--model-socket",
                  "/run/eko/model.sock" if sandbox else str(runtime / "model.sock"),
@@ -961,15 +985,18 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         "--ro-bind", str(environment), "/opt/eko", "--dir", "/run",
         "--dir", "/opt/eko-packages", *package_mounts,
         "--ro-bind", str(source), "/run/eko.py",
+        "--ro-bind", str(host_source), "/run/eko-host.py",
+        "--ro-bind", str(models_source), "/run/models.py",
         "--bind", str(cwd), "/workspace", *mount_arguments,
         "--bind", str(runtime), "/run/eko",
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
         "--remount-ro", "/", "--setenv", "HOME", "/workspace",
         "--setenv", "TMPDIR", "/tmp", "--setenv", "LANG", "C.UTF-8",
         "--setenv", "PATH", "/opt/eko/bin:/usr/bin:/bin",
-        "--setenv", "PYTHONPATH", os.pathsep.join(package_paths),
+        "--setenv", "PYTHONPATH", os.pathsep.join(["/run", *package_paths]),
         "--setenv", "VIRTUAL_ENV", "/opt/eko",
         "--setenv", "EKO_MODEL", "/run/eko/model.sock",
+        "--setenv", "EKO_HOST", "/run/eko-host.py",
         "--setenv", "EKO_WORLD", "/run/eko/world.sock",
         "--chdir", "/workspace", str(interpreter), "/run/eko.py",
         *arguments,

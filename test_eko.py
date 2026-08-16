@@ -1297,6 +1297,97 @@ class ModelTests(unittest.TestCase):
             "state_root": state,
         }])
 
+    def test_model_server_rejects_ambiguous_trajectory_storage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                host.ModelServer(
+                    root / "model.sock", root, "model", "high",
+                    trajectory_path=root / "one.jsonl",
+                    trajectory_dir=root / "traces")
+
+    def test_tinker_connection_uses_session_trajectory_in_directory(self):
+        session_id = "12345678-1234-5678-1234-567812345678"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server, client = socket.socketpair()
+            observed = []
+
+            class Conversation:
+                def __init__(self, *_args, **kwargs):
+                    observed.append(kwargs)
+
+                def close(self):
+                    pass
+
+            thread = threading.Thread(target=host._model_client, args=(
+                server, root, "thinkingmachines/Inkling-Small", "high"),
+                kwargs={"tinker_client": object(),
+                        "trajectory_dir": root / "traces"})
+            with mock.patch.object(host, "Tinker", Conversation):
+                thread.start()
+                client.sendall((json.dumps({
+                    "system": "test", "model": "thinkingmachines/Inkling-Small",
+                    "session_id": session_id,
+                }) + "\n").encode())
+                client.shutdown(socket.SHUT_WR)
+                thread.join(2)
+            client.close()
+
+        self.assertEqual(observed[0]["trajectory_path"],
+                         root / "traces" / f"{session_id}.jsonl")
+
+    def test_shared_tinker_server_records_each_session_separately(self):
+        sessions = (
+            "12345678-1234-5678-1234-567812345678",
+            "87654321-4321-8765-4321-876543218765",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            class Conversation:
+                context_used = 1
+
+                def __init__(self, *_args, trajectory_path=None, **_kwargs):
+                    self.path = trajectory_path
+
+                def complete(self, _system, message, _text, _python,
+                             max_turns=0):
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    self.path.write_text(json.dumps({
+                        "type": "episode_end", "message": eko.message_text(message)
+                    }) + "\n")
+                    return eko.Message("assistant", (eko.Text("done"),))
+
+                def interrupt(self):
+                    pass
+
+                def close(self):
+                    pass
+
+            server = host.ModelServer(
+                root / "model.sock", root, "thinkingmachines/Inkling-Small",
+                "high", tinker_client=object(), trajectory_dir=root / "traces")
+            with mock.patch.object(host, "Tinker", Conversation):
+                server.start()
+                for session_id in sessions:
+                    remote = eko.Model(
+                        root / "model.sock", "thinkingmachines/Inkling-Small",
+                        "high", session_id)
+                    remote.start("system")
+                    reply = remote.send(
+                        conversation(session_id)[0], lambda _text: None)
+                    self.assertEqual(eko.message_text(reply), "done")
+                    remote.close()
+                server.close()
+
+            records = [json.loads(
+                (root / "traces" / f"{session_id}.jsonl").read_text())
+                for session_id in sessions]
+
+        self.assertEqual([record["message"] for record in records],
+                         list(sessions))
+
     def test_host_accepts_an_explicit_world_socket(self):
         with (
             mock.patch.object(
@@ -1449,7 +1540,8 @@ class ModelTests(unittest.TestCase):
         pythonpath = command.index("PYTHONPATH")
         self.assertEqual(command[pythonpath - 1], "--setenv")
         paths = command[pythonpath + 1].split(os.pathsep)
-        self.assertTrue(all(path.startswith("/opt/eko") for path in paths))
+        self.assertEqual(paths[0], "/run")
+        self.assertTrue(all(path.startswith("/opt/eko") for path in paths[1:]))
         self.assertTrue(any(path.startswith("/opt/eko/") for path in paths))
 
     def test_world_relay_forwards_stream_without_interpreting_it(self):
