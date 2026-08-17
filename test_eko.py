@@ -160,6 +160,17 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn(eko.CLEAN_WORKSPACE, plain.system)
         self.assertIn(eko.CLEAN_WORKSPACE, clean.system)
 
+    def test_system_prompt_appendix_is_opt_in(self):
+        plain = eko.Eko(Path.cwd(), FakeModel(lambda *_: "<done/>"))
+        tagged = "<disposition>explore</disposition>"
+        extended = eko.Eko(
+            Path.cwd(), FakeModel(lambda *_: "<done/>"),
+            append_system_prompt=tagged,
+        )
+
+        self.assertNotIn(tagged, plain.system)
+        self.assertTrue(extended.system.endswith(f"\n{tagged}\n"))
+
     def test_context_status_line_is_not_a_provenance_header(self):
         self.assertEqual(
             eko.context_status_line(64_000, 128_000),
@@ -1328,7 +1339,7 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(reply, eko.Message(
                 "assistant", (eko.Text("text-22"),)))
             self.assertEqual(model.messages[-2]["role"], "user")
-            self.assertIn('<input source="harness">\nUse the python tool.',
+            self.assertIn('<input source="harness">\nContinue acting autonomously.',
                           model.messages[-2]["content"])
 
     def test_tinker_interrupt_closes_trajectory_after_tool_result(self):
@@ -1471,6 +1482,17 @@ class ModelTests(unittest.TestCase):
         )
 
         self.assertEqual(command[-2:], ["--", prompt])
+
+    def test_agent_command_forwards_system_prompt_appendix(self):
+        appendix = "<disposition>explore</disposition>"
+        command = host._agent_command(
+            Path.cwd(), Path("/tmp/runtime"), sandbox=False, feral=True,
+            name="Eko", prompt="Begin.", append_system_prompt=appendix,
+        )
+
+        index = command.index("--append-system-prompt")
+        self.assertEqual(command[index + 1], appendix)
+        self.assertEqual(command[-2:], ["--", "Begin."])
 
     def test_agent_command_forwards_max_turns(self):
         command = host._agent_command(

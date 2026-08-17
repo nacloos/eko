@@ -920,6 +920,7 @@ def _package_mounts(environment: Path, base: Path) -> tuple[list[str], list[str]
 def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    feral: bool, name: str, context: int = 0,
                    prompt: str | None = None,
+                   append_system_prompt: str | None = None,
                    python_timeout: float = core.PYTHON_TIMEOUT,
                    max_turns: int = 0,
                    clean_workspace: bool = False, model: str | None = None,
@@ -945,6 +946,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         arguments.extend(("--resume" if resume else "--session-id", session_id))
     if context:
         arguments.extend(("--context", str(context)))
+    if append_system_prompt:
+        arguments.extend(("--append-system-prompt", append_system_prompt))
     if clean_workspace:
         arguments.append("--clean-workspace")
     if feral:
@@ -1051,6 +1054,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         world_socket: Path | None = None, session_id: str | None = None,
         resume: bool = False, context: int = 0,
         clean_workspace: bool = False,
+        append_system_prompt: str | None = None,
         python_timeout: float = core.PYTHON_TIMEOUT,
         max_turns: int = 0, exit_when_idle: bool = False,
         upstream_model_socket: Path | None = None,
@@ -1087,6 +1091,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             _agent_command(
                 cwd, runtime, sandbox=sandbox, feral=feral, name=name,
                 context=context, clean_workspace=clean_workspace,
+                append_system_prompt=append_system_prompt,
                 python_timeout=python_timeout, max_turns=max_turns,
                 model=model, effort=effort, session_id=session_id, resume=resume,
                 prompt=prompt, mounts=mounts,
@@ -1140,6 +1145,10 @@ def main() -> None:
     parser.add_argument("--effort", default="high")
     parser.add_argument("--name", default=core.NAME)
     parser.add_argument("--context", type=int, default=0)
+    parser.add_argument(
+        "--append-system-prompt",
+        help="append text to Eko's standard system prompt",
+    )
     parser.add_argument(
         "--python-timeout", type=float, default=core.PYTHON_TIMEOUT,
         help=f"maximum seconds per Python action (default: {core.PYTHON_TIMEOUT:g})",
@@ -1196,6 +1205,7 @@ def main() -> None:
             session_id=args.session_id or args.resume,
             resume=args.resume is not None, context=args.context,
             clean_workspace=args.clean_workspace,
+            append_system_prompt=args.append_system_prompt,
             python_timeout=args.python_timeout, max_turns=args.max_turns,
             exit_when_idle=args.exit_when_idle,
             upstream_model_socket=args.upstream_model_socket,

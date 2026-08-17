@@ -84,7 +84,7 @@ you currently believe, and why the next action will help. Include enough detail 
 make the reasoning understandable and useful on its own."""
 
 NUDGE = "Use the python tool, or <done/> if the prompt is resolved."
-FERAL_NUDGE = "Use the python tool."
+FERAL_NUDGE = "Continue acting autonomously."
 NORMAL_MODE = (" If no action is needed, answer directly. When the prompt is "
                "fully resolved, end with <done/>. <done/> and a Python tool "
                "call are mutually exclusive: if you emit <done/>, do not call "
@@ -176,6 +176,7 @@ class Eko:
                  observer: Callable[[Event], None] | None = None,
                  name: str = NAME, context: int = 0,
                  clean_workspace: bool = False,
+                 append_system_prompt: str | None = None,
                  python_timeout: float = PYTHON_TIMEOUT,
                  max_turns: int = 0) -> None:
         self.cwd = cwd.resolve()
@@ -190,6 +191,8 @@ class Eko:
             self.system += f"\n{CLAUDE_REASONING}\n"
         if clean_workspace:
             self.system += f"\n{CLEAN_WORKSPACE}\n"
+        if append_system_prompt:
+            self.system += f"\n{append_system_prompt}\n"
         self.messages: list[Message] = []
         self.context = context
         self.python_timeout = python_timeout
@@ -895,6 +898,7 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
           feral: bool = False, name: str = NAME,
           socket_path: Path | None = None, context: int = 0,
           clean_workspace: bool = False, model: str | None = None,
+          append_system_prompt: str | None = None,
           effort: str | None = None, session_id: str | None = None,
           resume: bool = False,
           python_timeout: float = PYTHON_TIMEOUT,
@@ -917,6 +921,7 @@ def serve(cwd: Path, model_socket: Path, *, prompt: str | None = None,
         socket_path=socket_path,
         observer=lambda event: write(encode_event(event)), name=name,
         context=context, clean_workspace=clean_workspace,
+        append_system_prompt=append_system_prompt,
         python_timeout=python_timeout, max_turns=max_turns)
     processes: dict[str, tuple[subprocess.Popen, object | None]] = {}
 
@@ -1061,6 +1066,10 @@ def main() -> None:
     parser.add_argument("--feral", action="store_true")
     parser.add_argument("--context", type=int, default=0)
     parser.add_argument(
+        "--append-system-prompt",
+        help="append text to Eko's standard system prompt",
+    )
+    parser.add_argument(
         "--python-timeout", type=float,
         default=float(os.environ.get("EKO_PYTHON_TIMEOUT", PYTHON_TIMEOUT)),
         help=f"maximum seconds per Python action (default: {PYTHON_TIMEOUT:g})",
@@ -1084,6 +1093,7 @@ def main() -> None:
     serve(cwd, args.model_socket, prompt=args.prompt, feral=args.feral,
           name=args.name, socket_path=args.session_socket, context=args.context,
           clean_workspace=args.clean_workspace, model=args.model,
+          append_system_prompt=args.append_system_prompt,
           effort=args.effort, session_id=args.session_id or args.resume,
           resume=args.resume is not None, python_timeout=args.python_timeout,
           max_turns=args.max_turns)
