@@ -1918,6 +1918,24 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(command[index - 1], "--setenv")
         self.assertEqual(command[index + 1], "/run/eko/world.sock")
 
+    def test_sandbox_sets_explicit_environment_variable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = host._agent_command(
+                Path.cwd(), Path(directory), sandbox=True,
+                feral=False, name="Moa",
+                sandbox_env=(("REPOSITORY_URL", "http://127.0.0.1:3000/repo.git"),),
+            )
+
+        index = command.index("REPOSITORY_URL")
+        self.assertEqual(command[index - 1], "--setenv")
+        self.assertEqual(command[index + 1], "http://127.0.0.1:3000/repo.git")
+
+    def test_env_parser_requires_assignment_with_valid_name(self):
+        self.assertEqual(host.parse_env("NAME=a=b"), ("NAME", "a=b"))
+        for value in ("NAME", "9NAME=value", "BAD-NAME=value"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                host.parse_env(value)
+
     def test_sandbox_executes_resolved_interpreter_not_relocated_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             command = host._agent_command(

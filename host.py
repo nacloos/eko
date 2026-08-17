@@ -16,6 +16,7 @@ import io
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -71,6 +72,16 @@ class ForwardSpec:
     @property
     def socket_name(self) -> str:
         return f"tcp-{self.port}.sock"
+
+
+def parse_env(value: str) -> tuple[str, str]:
+    """Parse an explicit sandbox environment assignment."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("env must be NAME=VALUE")
+    name, contents = value.split("=", 1)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+        raise argparse.ArgumentTypeError("env name is invalid")
+    return name, contents
 
 
 def parse_forward(value: str) -> ForwardSpec:
@@ -1054,7 +1065,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
                    clean_workspace: bool = False, model: str | None = None,
                    effort: str | None = None, session_id: str | None = None,
                    resume: bool = False,
-                   mounts: tuple[SandboxMount, ...] = ()) -> list[str]:
+                   mounts: tuple[SandboxMount, ...] = (),
+                   sandbox_env: tuple[tuple[str, str], ...] = ()) -> list[str]:
     source = Path(core.__file__).resolve()
     host_source = Path(__file__).resolve()
     models_source = Path(models.__file__).resolve()
@@ -1083,8 +1095,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
     if prompt:
         arguments.extend(("--", prompt))
     if not sandbox:
-        if mounts:
-            raise ValueError("sandbox mounts require sandbox=True")
+        if mounts or sandbox_env:
+            raise ValueError("sandbox options require sandbox=True")
         return [sys.executable, str(source), *arguments]
     bwrap = shutil.which("bwrap")
     if bwrap is None:
@@ -1140,6 +1152,8 @@ def _agent_command(cwd: Path, runtime: Path, *, sandbox: bool,
         "--setenv", "EKO_MODEL", "/run/eko/model.sock",
         "--setenv", "EKO_HOST", "/run/eko-host.py",
         "--setenv", "EKO_WORLD", "/run/eko/world.sock",
+        *(item for name, value in sandbox_env
+          for item in ("--setenv", name, value)),
         "--chdir", "/workspace", str(interpreter), "/run/eko.py",
         *arguments,
     ]
@@ -1188,7 +1202,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         upstream_model_socket: Path | None = None,
         on_ready: Callable[[AgentProcess], None] | None = None,
         mounts: tuple[SandboxMount, ...] = (),
-        forwards: tuple[ForwardSpec, ...] = ()) -> None:
+        forwards: tuple[ForwardSpec, ...] = (),
+        sandbox_env: tuple[tuple[str, str], ...] = ()) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -1237,7 +1252,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
                 append_system_prompt=append_system_prompt,
                 python_timeout=python_timeout, max_turns=max_turns,
                 model=model, effort=effort, session_id=session_id, resume=resume,
-                prompt=prompt, mounts=mounts,
+                prompt=prompt, mounts=mounts, sandbox_env=sandbox_env,
             ),
             env=environment,
         )
@@ -1320,6 +1335,10 @@ def main() -> None:
         help="forward host TCP to a Unix socket under /run/eko/forward",
     )
     parser.add_argument(
+        "--env", action="append", type=parse_env, default=[], metavar="NAME=VALUE",
+        help="set an environment variable inside the sandbox",
+    )
+    parser.add_argument(
         "--feral", action="store_true",
         help="start immediately and keep acting autonomously",
     )
@@ -1349,6 +1368,11 @@ def main() -> None:
         parser.error("--mount requires --sandbox")
     if args.forward and not args.sandbox:
         parser.error("--forward requires --sandbox")
+    if args.env and not args.sandbox:
+        parser.error("--env requires --sandbox")
+    names = [name for name, _value in args.env]
+    if len(names) != len(set(names)):
+        parser.error("duplicate --env name")
     ports = [forward.port for forward in args.forward]
     if len(ports) != len(set(ports)):
         parser.error("duplicate --forward port")
@@ -1364,7 +1388,8 @@ def main() -> None:
             python_timeout=args.python_timeout, max_turns=args.max_turns,
             exit_when_idle=args.exit_when_idle,
             upstream_model_socket=args.upstream_model_socket,
-            mounts=tuple(args.mount), forwards=tuple(args.forward))
+            mounts=tuple(args.mount), forwards=tuple(args.forward),
+            sandbox_env=tuple(args.env))
 
     try:
         if args.feral and args.cwd is None:
