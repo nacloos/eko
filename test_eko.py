@@ -1511,6 +1511,32 @@ class ModelTests(unittest.TestCase):
 
         self.assertIn("--clean-workspace", command)
 
+    def test_forward_parser_accepts_fixed_tcp_destination(self):
+        ipv4 = host.parse_forward("127.0.0.1:3000")
+        ipv6 = host.parse_forward("[::1]:4000")
+
+        self.assertEqual(ipv4, host.ForwardSpec("127.0.0.1", 3000))
+        self.assertEqual(ipv4.socket_name, "tcp-3000.sock")
+        self.assertEqual(ipv6, host.ForwardSpec("::1", 4000))
+
+    def test_forward_parser_rejects_invalid_destination(self):
+        invalid = ("", "127.0.0.1", ":3000", "127.0.0.1:0",
+                   "127.0.0.1:65536", "[::1:3000")
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    host.parse_forward(value)
+
+    def test_forward_does_not_change_direct_sandbox_agent_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = host._agent_command(
+                Path.cwd(), Path(directory), sandbox=True, feral=False,
+                name="Eko")
+
+        source_index = len(command) - 1 - command[::-1].index("/run/eko.py")
+        self.assertEqual(command[source_index - 1], str(Path(sys.executable).resolve()))
+        self.assertIn("--unshare-net", command)
+
     def test_standard_readonly_bind_mount_is_forwarded_to_sandbox(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1937,6 +1963,40 @@ class ModelTests(unittest.TestCase):
                 listener.close()
                 server.join(2)
             self.assertFalse((root / "world.sock").exists())
+
+    def test_tcp_forward_relays_through_private_unix_socket(self):
+        destination = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        destination.bind(("127.0.0.1", 0))
+        destination.listen()
+        destination_port = destination.getsockname()[1]
+
+        def echo():
+            connection, _ = destination.accept()
+            with connection:
+                while data := connection.recv(65536):
+                    connection.sendall(data)
+
+        server = threading.Thread(target=echo)
+        server.start()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "forward" / "tcp-3000.sock"
+            relay = host.TcpRelay(path, "127.0.0.1", destination_port)
+            relay.start()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(str(path))
+                    payload = os.urandom(200_000)
+                    client.sendall(payload)
+                    client.shutdown(socket.SHUT_WR)
+                    received = bytearray()
+                    while data := client.recv(65536):
+                        received.extend(data)
+                    self.assertEqual(received, payload)
+            finally:
+                relay.close()
+                destination.close()
+                server.join(2)
+            self.assertFalse(path.exists())
 
     @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
     def test_sandbox_shutdown_removes_socket_and_detached_descendants(self):

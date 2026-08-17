@@ -59,6 +59,19 @@ eko --sandbox --cwd workspace \
 Use `readonly` (or `ro`) for evidence and datasets the agent must not modify.
 As in Docker and Podman, a bind mount is writable when that option is omitted.
 
+Forward a fixed host TCP endpoint into an otherwise network-isolated sandbox
+with `--forward HOST:PORT`. Each endpoint appears as a Unix stream socket under
+`/run/eko/forward/`; general network access remains disabled. Repeat the option
+as needed:
+
+```bash
+eko --sandbox --forward 127.0.0.1:3000
+# available inside the sandbox at /run/eko/forward/tcp-3000.sock
+```
+
+Eko does not create a sandbox TCP listener or prescribe a client. The agent may
+connect to the Unix socket directly or construct its own local adapter.
+
 Python actions time out after 30 seconds by default. Override this for either the
 included host or the provider-neutral agent with `--python-timeout SECONDS`.
 

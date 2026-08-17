@@ -63,6 +63,42 @@ class SandboxMount:
     readonly: bool = False
 
 
+@dataclass(frozen=True)
+class ForwardSpec:
+    host: str
+    port: int
+
+    @property
+    def socket_name(self) -> str:
+        return f"tcp-{self.port}.sock"
+
+
+def parse_forward(value: str) -> ForwardSpec:
+    """Parse a fixed TCP destination as HOST:PORT or [IPV6]:PORT."""
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing < 0 or value[closing + 1:closing + 2] != ":":
+            raise argparse.ArgumentTypeError(
+                "forward must be HOST:PORT or [IPV6]:PORT")
+        host, port_text = value[1:closing], value[closing + 2:]
+    else:
+        try:
+            host, port_text = value.rsplit(":", 1)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "forward must be HOST:PORT or [IPV6]:PORT") from error
+    if not host:
+        raise argparse.ArgumentTypeError("forward host is required")
+    try:
+        port = int(port_text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("forward port must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            "forward port must be between 1 and 65535")
+    return ForwardSpec(host, port)
+
+
 def parse_mount(value: str) -> SandboxMount:
     """Parse Docker/Podman-style --mount type=bind,... syntax."""
     options: dict[str, str] = {}
@@ -883,6 +919,98 @@ class WorldRelay:
         self.path.unlink(missing_ok=True)
 
 
+class TcpRelay:
+    """Relay one private Unix socket to one fixed host TCP destination."""
+
+    def __init__(self, path: Path, host: str, port: int) -> None:
+        self.path = path.resolve()
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        if not addresses:
+            raise OSError(f"cannot resolve forward destination {host}:{port}")
+        self.family, self.socket_type, self.protocol, _, self.address = addresses[0]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.unlink(missing_ok=True)
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        self.path.chmod(0o600)
+        self.listener.listen()
+        self.listener.settimeout(.2)
+        self.stopping = threading.Event()
+        self.connections: set[socket.socket] = set()
+        self.connection_lock = threading.Lock()
+        self.clients: list[threading.Thread] = []
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.started = False
+
+    def start(self) -> None:
+        self.thread.start()
+        self.started = True
+
+    def _run(self) -> None:
+        while not self.stopping.is_set():
+            try:
+                downstream, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            thread = threading.Thread(
+                target=self._bridge, args=(downstream,), daemon=True)
+            self.clients.append(thread)
+            thread.start()
+
+    def _bridge(self, downstream: socket.socket) -> None:
+        upstream = socket.socket(self.family, self.socket_type, self.protocol)
+        sockets = (downstream, upstream)
+        with self.connection_lock:
+            self.connections.update(sockets)
+        try:
+            upstream.connect(self.address)
+            pumps = [
+                threading.Thread(
+                    target=self._pump, args=(source, destination), daemon=True)
+                for source, destination in (
+                    (downstream, upstream), (upstream, downstream))
+            ]
+            for thread in pumps:
+                thread.start()
+            for thread in pumps:
+                thread.join()
+        except OSError:
+            pass
+        finally:
+            with self.connection_lock:
+                self.connections.difference_update(sockets)
+            for connection in sockets:
+                connection.close()
+
+    @staticmethod
+    def _pump(source: socket.socket, destination: socket.socket) -> None:
+        try:
+            while data := source.recv(64 * 1024):
+                destination.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                destination.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self.stopping.set()
+        self.listener.close()
+        with self.connection_lock:
+            connections = tuple(self.connections)
+        for connection in connections:
+            connection.close()
+        if self.started:
+            self.thread.join(2)
+        for thread in self.clients:
+            thread.join(2)
+        self.path.unlink(missing_ok=True)
+
+
 def _mount_parents(path: Path) -> list[str]:
     parents = list(path.parents)[:-1]
     return [item for parent in reversed(parents)
@@ -1059,7 +1187,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         max_turns: int = 0, exit_when_idle: bool = False,
         upstream_model_socket: Path | None = None,
         on_ready: Callable[[AgentProcess], None] | None = None,
-        mounts: tuple[SandboxMount, ...] = ()) -> None:
+        mounts: tuple[SandboxMount, ...] = (),
+        forwards: tuple[ForwardSpec, ...] = ()) -> None:
     cwd = cwd.expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"not a directory: {cwd}")
@@ -1084,6 +1213,20 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         )
         if relay is not None:
             relay.start()
+        forward_relays: list[TcpRelay] = []
+        try:
+            for forward in forwards:
+                forward_relays.append(TcpRelay(
+                    runtime / "forward" / forward.socket_name,
+                    forward.host,
+                    forward.port,
+                ))
+            for forward_relay in forward_relays:
+                forward_relay.start()
+        except BaseException:
+            for forward_relay in forward_relays:
+                forward_relay.close()
+            raise
         environment = os.environ.copy()
         environment["EKO_MODEL"] = str(runtime / "model.sock")
         environment["EKO_WORLD"] = str(runtime / "world.sock")
@@ -1128,6 +1271,8 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
             agent.stop()
             if relay is not None:
                 relay.close()
+            for forward_relay in forward_relays:
+                forward_relay.close()
             if model_relay is not None:
                 model_relay.close()
             if server is not None:
@@ -1170,6 +1315,11 @@ def main() -> None:
         help="sandbox mount: type=bind,source=PATH,target=/workspace/PATH[,readonly]",
     )
     parser.add_argument(
+        "--forward", action="append", type=parse_forward, default=[],
+        metavar="HOST:PORT",
+        help="forward host TCP to a Unix socket under /run/eko/forward",
+    )
+    parser.add_argument(
         "--feral", action="store_true",
         help="start immediately and keep acting autonomously",
     )
@@ -1197,6 +1347,11 @@ def main() -> None:
         parser.error("--exit-when-idle requires --headless")
     if args.mount and not args.sandbox:
         parser.error("--mount requires --sandbox")
+    if args.forward and not args.sandbox:
+        parser.error("--forward requires --sandbox")
+    ports = [forward.port for forward in args.forward]
+    if len(ports) != len(set(ports)):
+        parser.error("duplicate --forward port")
 
     def launch(cwd: Path) -> None:
         run(cwd, args.prompt, model=args.model, effort=args.effort,
@@ -1209,7 +1364,7 @@ def main() -> None:
             python_timeout=args.python_timeout, max_turns=args.max_turns,
             exit_when_idle=args.exit_when_idle,
             upstream_model_socket=args.upstream_model_socket,
-            mounts=tuple(args.mount))
+            mounts=tuple(args.mount), forwards=tuple(args.forward))
 
     try:
         if args.feral and args.cwd is None:
