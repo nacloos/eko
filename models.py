@@ -263,7 +263,8 @@ class Tinker:
     def complete(self, system: str, message: core.Message,
                  on_text: Callable[[str], None],
                  on_python: Callable[[str], core.Result],
-                 max_turns: int = 0, feral: bool = False) -> core.Message:
+                 max_turns: int = 0, feral: bool = False,
+                 on_context: Callable[[int], None] | None = None) -> core.Message:
         if message.role != "user":
             raise ValueError("model input must be a user message")
         if self.system is None:
@@ -291,6 +292,10 @@ class Tinker:
         try:
             while True:
                 prompt = renderer.build_generation_prompt(messages, **options)
+                self.context_used = sum(
+                    int(chunk.length) for chunk in prompt.chunks)
+                if on_context is not None:
+                    on_context(self.context_used)
                 if self.interrupted.is_set():
                     raise InterruptedError
                 future = client.sample(
@@ -678,7 +683,8 @@ class Claude:
                  on_python: Callable[[str], core.Result] | None = None,
                  retry_delay: float = .2,
                  retries: int = 0,
-                 max_turns: int = 0, feral: bool = False) -> core.Message:
+                 max_turns: int = 0, feral: bool = False,
+                 on_context: Callable[[int], None] | None = None) -> core.Message:
         """Complete a history using the CLI's internally persisted conversation."""
         if message.role != "user":
             raise ValueError("model input must be a user message")
@@ -708,26 +714,23 @@ class Claude:
                 if data.get("type") == "stream_event":
                     event = data.get("event", {})
                     delta = event.get("delta", {})
+                    if event.get("type") == "message_delta":
+                        self._update_context(event.get("usage"), on_context)
                     if (event.get("type") == "content_block_delta"
                             and delta.get("type") == "text_delta"):
                         text = delta.get("text", "")
                         parts.append(text)
                         on_text(text)
                 elif data.get("type") == "assistant":
+                    self._update_context(
+                        data.get("message", {}).get("usage"), on_context)
                     complete = "".join(
                         block["text"] for block in data["message"].get("content", [])
                         if block.get("type") == "text")
                 elif data.get("type") == "result":
                     if data.get("subtype") == "error_max_turns" and max_turns:
                         self.limit_reached = True
-                        usage = data.get("usage") or {}
-                        self.context_used = (int(usage["prompt_tokens"])
-                                             if usage.get("prompt_tokens") is not None
-                                             else sum(int(usage.get(name) or 0)
-                                                      for name in (
-                                                          "input_tokens",
-                                                          "cache_read_input_tokens",
-                                                          "cache_creation_input_tokens")))
+                        self._update_context(data.get("usage"), on_context)
                         self._finish()
                         return core.Message("assistant", ())
                     if data.get("is_error"):
@@ -740,7 +743,8 @@ class Claude:
                                     and self._repair_session()):
                                 return self.complete(
                                     system, message, on_text, on_python,
-                                    retry_delay, retries, max_turns, feral)
+                                    retry_delay, retries, max_turns, feral,
+                                    on_context)
                             if (retries < RESUME_RETRIES
                                     and not parts and not complete):
                                 if self.interrupted.wait(retry_delay):
@@ -748,17 +752,12 @@ class Claude:
                                 return self.complete(
                                     system, message, on_text, on_python,
                                     min(retry_delay * 2, 5), retries + 1,
-                                    max_turns, feral)
+                                    max_turns, feral, on_context)
                             raise RuntimeError(
                                 "Model session could not resume; context was not "
                                 f"reset. {detail or ''}".rstrip())
                         raise RuntimeError(detail or "Model call failed")
-                    usage = data.get("usage") or {}
-                    self.context_used = (int(usage["prompt_tokens"])
-                                         if usage.get("prompt_tokens") is not None else
-                                         sum(int(usage.get(name) or 0) for name in (
-                                             "input_tokens", "cache_read_input_tokens",
-                                             "cache_creation_input_tokens")))
+                    self._update_context(data.get("usage"), on_context)
                     return core.Message(
                         "assistant", (core.Text(complete or "".join(parts)),))
         finally:
@@ -767,6 +766,28 @@ class Claude:
         if self.interrupted.is_set():
             raise InterruptedError
         raise RuntimeError("Model process exited without a result")
+
+    def _update_context(self, usage: Any,
+                        on_context: Callable[[int], None] | None) -> None:
+        """Record the latest prompt size, never cumulative multi-turn billing."""
+        if not isinstance(usage, dict):
+            return
+        iterations = usage.get("iterations")
+        if isinstance(iterations, list) and iterations:
+            latest = iterations[-1]
+            if isinstance(latest, dict):
+                usage = latest
+        if usage.get("prompt_tokens") is not None:
+            used = int(usage["prompt_tokens"])
+        else:
+            names = ("input_tokens", "cache_read_input_tokens",
+                     "cache_creation_input_tokens")
+            if not any(usage.get(name) is not None for name in names):
+                return
+            used = sum(int(usage.get(name) or 0) for name in names)
+        self.context_used = used
+        if on_context is not None:
+            on_context(used)
 
     def close(self) -> None:
         """Give the CLI a brief chance to flush its session, then stop it."""

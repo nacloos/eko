@@ -72,7 +72,8 @@ class FakeModel:
     def start(self, system):
         self.system = system
 
-    def send(self, message, write, python=lambda _code: None):
+    def send(self, message, write, python=lambda _code: None,
+             context=lambda _used: None):
         text = "\n".join(
             line for line in eko.message_text(message).splitlines()
             if not line.startswith("<input source=") and line != "</input>"
@@ -90,11 +91,11 @@ class FakeModel:
         return eko.Message("assistant", (eko.Text(reply),))
 
     def complete(self, system, message, write, python=lambda _code: None,
-                 max_turns=0, feral=False):
+                 max_turns=0, feral=False, on_context=None):
         self.max_turns = max_turns
         self.feral = feral
         self.start(system)
-        return self.send(message, write, python)
+        return self.send(message, write, python, on_context or (lambda _used: None))
 
     def interrupt(self):
         self.cancelled.set()
@@ -174,6 +175,53 @@ class CoreTests(unittest.TestCase):
         wait_until(lambda: len(model.messages) == 1 and agent.state == "idle")
 
         self.assertIn(eko.Event("context", (64_000, 128_000)), events)
+        agent.stop()
+        agent.wait(2)
+
+    def test_context_usage_is_observable_during_a_python_tool_loop(self):
+        class LiveContextModel(FakeModel):
+            def send(self, message, write, python=lambda _code: None,
+                     context=lambda _used: None):
+                self.messages.append(eko.message_text(message))
+                self.context_used = 60
+                context(self.context_used)
+                self.tool_result = python("print('measured')")
+                write("finished<done/>")
+                return eko.Message("assistant", (eko.Text("finished<done/>"),))
+
+        model = LiveContextModel(lambda *_: "unused")
+        events = []
+        agent = eko.Eko(Path.cwd(), model, observer=events.append, context=100)
+        agent.start("hello")
+        wait_until(lambda: hasattr(model, "tool_result") and agent.state == "idle")
+
+        self.assertIn(eko.Event("context", (60, 100)), events)
+        guidance = [eko.message_text(eko.Message("user", item.content))
+                    for item in model.tool_result.inputs]
+        self.assertEqual(guidance, [eko.context_status_line(60, 100)])
+        agent.stop()
+        agent.wait(2)
+
+    def test_final_turn_guidance_is_delivered_inside_a_tool_loop(self):
+        class LiveContextModel(FakeModel):
+            def send(self, message, write, python=lambda _code: None,
+                     context=lambda _used: None):
+                self.messages.append(eko.message_text(message))
+                self.context_used = 95
+                context(self.context_used)
+                self.tool_result = python("print('memory saved')")
+                write("finished")
+                return eko.Message("assistant", (eko.Text("finished"),))
+
+        model = LiveContextModel(lambda *_: "unused")
+        agent = eko.Eko(Path.cwd(), model, context=100)
+        agent.start("hello")
+        wait_until(lambda: hasattr(model, "tool_result"))
+
+        guidance = [eko.message_text(eko.Message("user", item.content))
+                    for item in model.tool_result.inputs]
+        self.assertEqual(guidance, [eko.FAREWELL])
+        wait_until(lambda: model.resets == 1)
         agent.stop()
         agent.wait(2)
 
@@ -1646,7 +1694,7 @@ class ModelTests(unittest.TestCase):
                     self.path = trajectory_path
 
                 def complete(self, _system, message, _text, _python,
-                             max_turns=0):
+                             max_turns=0, on_context=None):
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                     self.path.write_text(json.dumps({
                         "type": "episode_end", "message": eko.message_text(message)
@@ -2216,6 +2264,50 @@ print("DAEMONS", *(process.pid for process in processes))
         reply = model.complete(eko.SYSTEM, conversation("hi")[0], streamed.append)
         self.assertEqual(eko.message_text(reply), "hello")
         self.assertEqual(streamed, ["hello"])
+        model.close()
+
+    def test_claude_context_uses_latest_iteration_not_cumulative_billing(self):
+        model = host.Claude(Path.cwd(), "fake", "low")
+        events = [
+            {"type": "assistant", "message": {
+                "usage": {"input_tokens": 2,
+                          "cache_read_input_tokens": 100,
+                          "cache_creation_input_tokens": 20},
+                "content": [{"type": "text", "text": "hello"}]}},
+            {"type": "stream_event", "event": {
+                "type": "message_delta",
+                "usage": {"input_tokens": 2,
+                          "cache_read_input_tokens": 200,
+                          "cache_creation_input_tokens": 30}}},
+            {"type": "result", "is_error": False, "usage": {
+                "input_tokens": 6,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 300,
+                "iterations": [{"input_tokens": 2,
+                                "cache_read_input_tokens": 200,
+                                "cache_creation_input_tokens": 30}]}},
+        ]
+        payload = "".join(json.dumps(event) + "\n" for event in events)
+        script = (
+            "import sys; sys.stdin.buffer.readline(); "
+            f"sys.stdout.buffer.write({payload.encode()!r}); "
+            "sys.stdout.buffer.flush()")
+
+        def start(_system):
+            model.proc = subprocess.Popen(
+                [sys.executable, "-c", script], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+            model.started = True
+
+        model._start = start
+        observed = []
+        reply = model.complete(
+            eko.SYSTEM, conversation("hi")[0], lambda _text: None,
+            on_context=observed.append)
+
+        self.assertEqual(eko.message_text(reply), "hello")
+        self.assertEqual(observed, [122, 232, 232])
+        self.assertEqual(model.context_used, 232)
         model.close()
 
     def test_interrupt_does_not_race_with_stdout_reader(self):

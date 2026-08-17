@@ -344,14 +344,41 @@ class Eko:
                     self._emit(Event("input", message))
                     acted = False
 
+                    def context_update(used: int) -> None:
+                        if self.context:
+                            self._emit(Event("context", (used, self.context)))
+
+                    def context_guidance() -> tuple[Input, ...]:
+                        if not self.context or self.reset_pending:
+                            return ()
+                        used = getattr(self.model, "context_used", 0)
+                        ratio = used / self.context
+                        if ratio >= RESET_AT:
+                            self.reset_pending = True
+                            return (Input(HARNESS, (Text(FAREWELL),)),)
+                        notice = max((threshold for threshold in CONTEXT_NOTICES
+                                      if ratio >= threshold), default=0)
+                        if notice > self.context_notice:
+                            self.context_notice = notice
+                            return (Input(HARNESS, (Text(
+                                context_status_line(used, self.context)
+                            ),)),)
+                        return ()
+
                     def run_python(code: str) -> Result:
                         nonlocal acted
                         acted = True
-                        return self._python(code)
+                        result = self._python(code)
+                        guidance = context_guidance()
+                        if not guidance:
+                            return result
+                        return Result(
+                            result.output, result.returncode, result.elapsed,
+                            (*result.inputs, *guidance))
 
                     reply = self.model.send(
                         message, lambda text: self._emit(Event("delta", text)),
-                        run_python)
+                        run_python, context_update)
                     if self.context:
                         self._emit(Event("context", (
                             getattr(self.model, "context_used", 0), self.context
@@ -780,12 +807,17 @@ class Model:
         self._send(hello)
 
     def send(self, message: Message, on_text: Callable[[str], None],
-             on_python: Callable[[str], Result] | None = None) -> Message:
+             on_python: Callable[[str], Result] | None = None,
+             on_context: Callable[[int], None] | None = None) -> Message:
         self._send({"message": encode_message(message)})
         while line := self.reader.readline():
             event = json.loads(line)
             if "delta" in event:
                 on_text(event["delta"])
+            elif "context_used" in event and "message" not in event:
+                self.context_used = int(event["context_used"])
+                if on_context is not None:
+                    on_context(self.context_used)
             elif "tool_call" in event:
                 call = event["tool_call"]
                 if on_python is None:

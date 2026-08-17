@@ -629,6 +629,7 @@ def _model_client(connection: socket.socket, cwd: Path,
             reply = conversation.complete(
                 system, core.decode_message(message),
                 lambda text: send({"delta": text}), python,
+                on_context=lambda used: send({"context_used": used}),
                 **options)
             send({"message": core.encode_message(reply),
                   "context_used": conversation.context_used,
