@@ -2230,6 +2230,33 @@ print("DAEMONS", *(process.pid for process in processes))
         self.assertTrue(process.stdin.closed)
         self.assertTrue(process.stdout.closed)
 
+    def test_oauth_token_uses_bare_bearer_authentication(self):
+        model = host.Claude(Path.cwd(), "fake", "low")
+        process = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {
+                "CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
+            }, clear=True),
+            mock.patch.object(subprocess, "Popen", return_value=process) as popen,
+        ):
+            model._start("system")
+
+        command = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertIn("--bare", command)
+        self.assertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "oauth-secret")
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+
+    def test_interactive_auth_does_not_enable_bare_mode(self):
+        model = host.Claude(Path.cwd(), "fake", "low")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(subprocess, "Popen", return_value=mock.Mock()) as popen,
+        ):
+            model._start("system")
+
+        self.assertNotIn("--bare", popen.call_args.args[0])
+
     def test_exact_empty_text_resume_error_repairs_only_its_assistant_block(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "projects" / "project"

@@ -600,6 +600,13 @@ class Claude:
         return False
 
     def _start(self, system: str, max_turns: int = 0) -> None:
+        environment = os.environ.copy()
+        oauth_token = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        if (oauth_token and not environment.get("ANTHROPIC_AUTH_TOKEN")
+                and not environment.get("ANTHROPIC_API_KEY")):
+            environment["ANTHROPIC_AUTH_TOKEN"] = oauth_token
+        bare = (["--bare"] if any(environment.get(name) for name in (
+            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")) else [])
         session = (["--resume", self.session_id] if self.started else
                    ["--session-id", self.session_id])
         config = json.dumps({"mcpServers": {"eko": {
@@ -608,7 +615,7 @@ class Claude:
                      str(self.broker.path), self.broker.token],
         }}})
         command = [
-            "claude", "-p", "--verbose", "--tools", "",
+            "claude", *bare, "-p", "--verbose", "--tools", "",
             "--strict-mcp-config", "--mcp-config", config,
             "--allowedTools", "mcp__eko__python", "--permission-mode", "dontAsk",
             "--setting-sources", "", "--settings", "{}",
@@ -622,7 +629,8 @@ class Claude:
         ]
         self.proc = subprocess.Popen(
             command, cwd=self.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
+            stderr=subprocess.STDOUT, bufsize=0, start_new_session=True,
+            env=environment)
         self.started = True
 
     def _write(self, event: dict) -> None:
