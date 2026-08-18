@@ -92,6 +92,8 @@ def parse_forward(value: str) -> ForwardSpec:
         name, value = value.split("=", 1)
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) is None:
             raise argparse.ArgumentTypeError("forward name is invalid")
+        if name in {"model", "session", "world"}:
+            raise argparse.ArgumentTypeError("forward name is reserved")
     if value.startswith("["):
         closing = value.find("]")
         if closing < 0 or value[closing + 1:closing + 2] != ":":
@@ -1238,7 +1240,7 @@ def run(cwd: Path, prompt: str | None, *, model: str, effort: str,
         try:
             for forward in forwards:
                 forward_relays.append(TcpRelay(
-                    runtime / "forward" / forward.socket_name,
+                    runtime / forward.socket_name,
                     forward.host,
                     forward.port,
                 ))
@@ -1338,7 +1340,7 @@ def main() -> None:
     parser.add_argument(
         "--forward", action="append", type=parse_forward, default=[],
         metavar="[NAME=]HOST:PORT",
-        help="forward host TCP to a Unix socket under /run/eko/forward",
+        help="forward host TCP to a Unix socket under /run/eko",
     )
     parser.add_argument(
         "--env", action="append", type=parse_env, default=[], metavar="NAME=VALUE",
@@ -1382,6 +1384,15 @@ def main() -> None:
     ports = [forward.port for forward in args.forward]
     if len(ports) != len(set(ports)):
         parser.error("duplicate --forward port")
+    socket_names = [forward.socket_name for forward in args.forward]
+    if len(socket_names) != len(set(socket_names)):
+        parser.error("duplicate --forward socket name")
+    reserved_sockets = {"model.sock", "session.sock", "world.sock"}
+    clashes = reserved_sockets.intersection(socket_names)
+    if clashes:
+        parser.error(
+            f"--forward socket name is reserved: {min(clashes)}"
+        )
 
     def launch(cwd: Path) -> None:
         run(cwd, args.prompt, model=args.model, effort=args.effort,

@@ -1531,7 +1531,10 @@ class ModelTests(unittest.TestCase):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     host.parse_forward(value)
 
-        for value in ("=127.0.0.1:3000", "bad/name=127.0.0.1:3000"):
+        for value in (
+            "=127.0.0.1:3000", "bad/name=127.0.0.1:3000",
+            "model=127.0.0.1:3000",
+        ):
             with self.assertRaises(argparse.ArgumentTypeError):
                 host.parse_forward(value)
 
@@ -2005,7 +2008,7 @@ class ModelTests(unittest.TestCase):
         server = threading.Thread(target=echo)
         server.start()
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "forward" / "tcp-3000.sock"
+            path = Path(directory) / "tcp-3000.sock"
             relay = host.TcpRelay(path, "127.0.0.1", destination_port)
             relay.start()
             try:
