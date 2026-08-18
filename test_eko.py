@@ -1514,9 +1514,13 @@ class ModelTests(unittest.TestCase):
     def test_forward_parser_accepts_fixed_tcp_destination(self):
         ipv4 = host.parse_forward("127.0.0.1:3000")
         ipv6 = host.parse_forward("[::1]:4000")
+        named = host.parse_forward("git-service=127.0.0.1:5000")
 
         self.assertEqual(ipv4, host.ForwardSpec("127.0.0.1", 3000))
         self.assertEqual(ipv4.socket_name, "tcp-3000.sock")
+        self.assertEqual(named.host, "127.0.0.1")
+        self.assertEqual(named.port, 5000)
+        self.assertEqual(named.socket_name, "git-service.sock")
         self.assertEqual(ipv6, host.ForwardSpec("::1", 4000))
 
     def test_forward_parser_rejects_invalid_destination(self):
@@ -1526,6 +1530,10 @@ class ModelTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     host.parse_forward(value)
+
+        for value in ("=127.0.0.1:3000", "bad/name=127.0.0.1:3000"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                host.parse_forward(value)
 
     def test_forward_does_not_change_direct_sandbox_agent_command(self):
         with tempfile.TemporaryDirectory() as directory:

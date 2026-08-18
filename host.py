@@ -68,10 +68,11 @@ class SandboxMount:
 class ForwardSpec:
     host: str
     port: int
+    name: str | None = None
 
     @property
     def socket_name(self) -> str:
-        return f"tcp-{self.port}.sock"
+        return f"{self.name or f'tcp-{self.port}'}.sock"
 
 
 def parse_env(value: str) -> tuple[str, str]:
@@ -85,7 +86,12 @@ def parse_env(value: str) -> tuple[str, str]:
 
 
 def parse_forward(value: str) -> ForwardSpec:
-    """Parse a fixed TCP destination as HOST:PORT or [IPV6]:PORT."""
+    """Parse [NAME=]HOST:PORT or [NAME=][IPV6]:PORT."""
+    name = None
+    if "=" in value:
+        name, value = value.split("=", 1)
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) is None:
+            raise argparse.ArgumentTypeError("forward name is invalid")
     if value.startswith("["):
         closing = value.find("]")
         if closing < 0 or value[closing + 1:closing + 2] != ":":
@@ -107,7 +113,7 @@ def parse_forward(value: str) -> ForwardSpec:
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError(
             "forward port must be between 1 and 65535")
-    return ForwardSpec(host, port)
+    return ForwardSpec(host, port, name)
 
 
 def parse_mount(value: str) -> SandboxMount:
@@ -1331,7 +1337,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--forward", action="append", type=parse_forward, default=[],
-        metavar="HOST:PORT",
+        metavar="[NAME=]HOST:PORT",
         help="forward host TCP to a Unix socket under /run/eko/forward",
     )
     parser.add_argument(
