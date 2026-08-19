@@ -793,6 +793,10 @@ class Claude:
             if not any(usage.get(name) is not None for name in names):
                 return
             used = sum(int(usage.get(name) or 0) for name in names)
+        # Claude CLI error records may carry a synthetic all-zero usage object.
+        # It is not a real empty prompt and must not erase the last measurement.
+        if used == 0 and self.context_used > 0:
+            return
         self.context_used = used
         if on_context is not None:
             on_context(used)

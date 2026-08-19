@@ -236,6 +236,30 @@ class CoreTests(unittest.TestCase):
         agent.stop()
         agent.wait(2)
 
+    def test_feral_plain_text_turns_reset_at_context_limit(self):
+        usages = iter((94, 96, 97, 1))
+        model = None
+
+        def replies(_message, _cancelled):
+            assert model is not None
+            model.context_used = next(usages)
+            if len(model.messages) == 4:
+                model.limit_reached = True
+            return "Holding."
+
+        model = FakeModel(replies)
+        agent = eko.Eko(
+            Path.cwd(), model, feral=True, context=100, max_turns=4)
+        agent.start()
+        wait_until(lambda: len(model.messages) == 4 and agent.state == "idle")
+
+        self.assertIn(eko.FERAL_NUDGE, model.messages[1])
+        self.assertIn(eko.FAREWELL, model.messages[2])
+        self.assertEqual(model.messages[3], "Begin.")
+        self.assertEqual(model.resets, 1)
+        agent.stop()
+        agent.wait(2)
+
     def test_context_usage_is_not_observable_when_disabled(self):
         model = FakeModel(lambda *_: "<done/>")
         model.context_used = 64_000
@@ -414,6 +438,39 @@ class ModelSocketTests(unittest.TestCase):
 
         self.assertEqual(reply, eko.Message("assistant", (eko.Text("HELLO"),)))
         self.assertEqual(streamed, ["HELLO"])
+
+    def test_model_connection_accepts_immediate_next_generation(self):
+        server, client = socket.socketpair()
+        model = FakeModel(lambda text, _cancelled: text.upper())
+
+        with mock.patch.object(host, "Claude", return_value=model):
+            thread = threading.Thread(
+                target=host._model_client,
+                args=(server, Path.cwd(), "claude-fake", "low"),
+                daemon=True,
+            )
+            thread.start()
+            endpoint = client.makefile("rwb", buffering=0)
+            endpoint.write((json.dumps({"system": eko.SYSTEM}) + "\n").encode())
+
+            for index in range(100):
+                message = eko.encode_message(conversation(f"turn-{index}")[0])
+                endpoint.write((json.dumps({"message": message}) + "\n").encode())
+                while True:
+                    event = json.loads(endpoint.readline())
+                    if "message" in event:
+                        self.assertEqual(
+                            eko.message_text(eko.decode_message(event["message"])),
+                            f"TURN-{index}",
+                        )
+                        break
+                    self.assertNotIn("error", event)
+
+            endpoint.close()
+            client.close()
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
 
     def test_connection_handshake_selects_model_and_session(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -808,6 +865,49 @@ class EkoTests(unittest.TestCase):
         assert agent.thread is not None
         self.assertTrue(agent.thread.is_alive())
         self.stop(agent)
+
+    def test_feral_agent_retries_transient_model_error(self):
+        calls = 0
+        model = None
+
+        def replies(message, _cancelled):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("server error mid-response")
+            assert model is not None
+            model.limit_reached = True
+            self.assertIn("model call failed transiently", message)
+            return "recovered"
+
+        model = FakeModel(replies)
+        agent = eko.Eko(Path.cwd(), model, feral=True, max_turns=2)
+        with mock.patch.object(eko, "MODEL_ERROR_RETRY_DELAY", .001):
+            agent.start()
+            wait_until(lambda: calls == 2 and agent.state == "idle")
+
+        self.assertEqual(calls, 2)
+        self.stop(agent)
+
+    def test_feral_agent_fails_after_bounded_model_retries(self):
+        calls = 0
+
+        def replies(_message, _cancelled):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("provider unavailable")
+
+        model = FakeModel(replies)
+        events = []
+        agent = eko.Eko(Path.cwd(), model, feral=True, observer=events.append)
+        with mock.patch.object(eko, "MODEL_ERROR_RETRY_DELAY", .001):
+            agent.start()
+            wait_until(lambda: agent.state == "failed")
+
+        self.assertEqual(calls, eko.MODEL_ERROR_RETRIES + 1)
+        self.assertIn(eko.Event("state", "failed"), events)
+        agent.stop()
+        agent.wait(2)
 
     def test_python_output_precedes_input_received_during_execution(self):
         def replies(message, cancelled):
@@ -2446,6 +2546,21 @@ print("DAEMONS", *(process.pid for process in processes))
         self.assertEqual(eko.message_text(reply), "hello")
         self.assertEqual(observed, [122, 232, 232])
         self.assertEqual(model.context_used, 232)
+        model.close()
+
+    def test_claude_zero_usage_error_does_not_erase_context(self):
+        model = host.Claude(Path.cwd(), "fake", "low")
+        model.context_used = 91_000
+        observed = []
+
+        model._update_context({
+            "input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }, observed.append)
+
+        self.assertEqual(model.context_used, 91_000)
+        self.assertEqual(observed, [])
         model.close()
 
     def test_interrupt_does_not_race_with_stdout_reader(self):

@@ -93,6 +93,8 @@ CLEAN_WORKSPACE = "Keep your workspace clean and organized."
 FAREWELL = "Final turn before reset."
 CONTEXT_NOTICES = (.50, .90)
 RESET_AT = .95
+MODEL_ERROR_RETRIES = 3
+MODEL_ERROR_RETRY_DELAY = .2
 MAX_INPUT_TEXT = 20_000
 PYTHON_TIMEOUT = 30.0
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -332,6 +334,7 @@ class Eko:
     def _run(self) -> None:
         """Alternate attributed inputs, model responses, and Python execution."""
         inputs = None
+        consecutive_model_errors = 0
         try:
             while True:
                 if inputs is None:
@@ -382,6 +385,7 @@ class Eko:
                     reply = self.model.send(
                         message, lambda text: self._emit(Event("delta", text)),
                         run_python, context_update)
+                    consecutive_model_errors = 0
                     if self.context:
                         self._emit(Event("context", (
                             getattr(self.model, "context_used", 0), self.context
@@ -414,7 +418,7 @@ class Eko:
                         assert self.opening_inputs is not None
                         inputs = self.opening_inputs + self._drain()
                     elif inputs is not None:
-                        if self.context and acted:
+                        if self.context:
                             used = getattr(self.model, "context_used", 0)
                             ratio = used / self.context
                             if ratio >= RESET_AT:
@@ -438,7 +442,21 @@ class Eko:
                     if self.stopping.is_set():
                         return
                     self._emit(Event("error", str(error)))
-                    inputs = None
+                    consecutive_model_errors += 1
+                    if (self.feral
+                            and consecutive_model_errors <= MODEL_ERROR_RETRIES
+                            and not self.interrupted.wait(
+                                MODEL_ERROR_RETRY_DELAY
+                                * (2 ** (consecutive_model_errors - 1)))):
+                        inputs = (Input(HARNESS, (Text(
+                            "The model call failed transiently. Continue from the "
+                            "persisted state without repeating completed actions."
+                        ),)),)
+                    elif self.feral:
+                        self._set_state("failed")
+                        return
+                    else:
+                        inputs = None
         finally:
             self.model.close()
 

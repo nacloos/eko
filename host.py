@@ -329,6 +329,9 @@ class UI:
                     self._start_activity("running")
                 else:
                     self._stop_activity()
+                if state == "failed":
+                    self.stopped("Agent failed after exhausting model retries")
+                    self.exit()
             elif event.type == "delta":
                 if stream is None:
                     stream = NativeStream(self)
@@ -543,6 +546,9 @@ class AgentProcess:
                     if kind == "state":
                         self.state = str(event.value)
                     self.observer(event)
+                    if kind == "state" and self.state == "failed":
+                        # Make terminal failure visible to supervising launchers.
+                        self._send({"type": "stop"})
         except Exception as error:
             message = f"Agent connection failed: {error}"
             self._record_startup_diagnostic(message)
@@ -655,6 +661,7 @@ def _model_client(connection: socket.socket, cwd: Path,
     conversation = None
     lock = threading.Lock()
     active: threading.Thread | None = None
+    active_replied: threading.Event | None = None
     tool_results: dict[str, queue.Queue[core.Result]] = {}
 
     def send(value: dict) -> None:
@@ -686,13 +693,19 @@ def _model_client(connection: socket.socket, cwd: Path,
                 lambda text: send({"delta": text}), python,
                 on_context=lambda used: send({"context_used": used}),
                 **options)
+            assert active_replied is not None
+            active_replied.set()
             send({"message": core.encode_message(reply),
                   "context_used": conversation.context_used,
                   "limit_reached": getattr(
                       conversation, "limit_reached", False)})
         except InterruptedError:
+            assert active_replied is not None
+            active_replied.set()
             send({"error": "Interrupted", "interrupted": True})
         except Exception as error:
+            assert active_replied is not None
+            active_replied.set()
             send({"error": str(error)})
 
     try:
@@ -766,11 +779,22 @@ def _model_client(connection: socket.socket, cwd: Path,
                                 tuple(core.decode_encoded_input(item)
                                       for item in raw.get("inputs", [])),
                             ))
-                    elif (isinstance(request.get("message"), dict) and
-                          (active is None or not active.is_alive())):
-                        active = threading.Thread(
-                            target=complete, args=(request["message"],), daemon=True)
-                        active.start()
+                    elif isinstance(request.get("message"), dict):
+                        # An autonomous client can submit its next turn as soon as
+                        # it receives our reply, just before that worker returns.
+                        # A replied worker no longer owns the conversation.
+                        if (active is not None and active.is_alive()
+                                and active_replied is not None
+                                and active_replied.is_set()):
+                            active.join()
+                        if active is None or not active.is_alive():
+                            active_replied = threading.Event()
+                            active = threading.Thread(
+                                target=complete, args=(request["message"],),
+                                daemon=True)
+                            active.start()
+                        else:
+                            send({"error": "model generation already active"})
                     else:
                         send({"error": "model generation already active"})
             except (json.JSONDecodeError, UnicodeDecodeError):
